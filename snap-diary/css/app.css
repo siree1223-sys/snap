@@ -358,3 +358,28 @@ img.ph:not([src]) { visibility: hidden; }
 .lightbox.player video { width: 100%; max-height: 80dvh; border-radius: 10px; background: #000; }
 .player-status { display: grid; justify-items: center; gap: 12px; text-align: center; color: #ddd; max-width: 320px; }
 .btn.light { color: #fff; border-color: rgba(255, 255, 255, .35); }
+
+/* ---------- photo capture info / organizer ---------- */
+.hint-banner {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: -2px 0 12px; padding: 10px 12px;
+  border-radius: 14px; background: var(--accent-soft); color: var(--text); font-size: .9rem;
+}
+.hint-banner[hidden] { display: none; }
+.hint-banner span { flex: 1; min-width: 160px; }
+.chip-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: -6px 0 12px; }
+.gphotos { margin: 4px 0 10px; }
+.organize .btn-row { margin: 6px 0 4px; }
+.organize-status { min-height: 1.2em; margin: 10px 2px; }
+.org-day { display: block; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; margin-bottom: 10px; }
+.org-day.off { opacity: .45; }
+.org-head { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.org-head input { width: 20px; height: 20px; accent-color: var(--accent); }
+.org-head strong { flex: 1; }
+.org-place-row { display: flex; align-items: center; gap: 6px; margin: 8px 0 4px; color: var(--muted); }
+.org-place { flex: 1; border: 1px solid var(--line); background: var(--bg); border-radius: 10px; padding: 7px 10px; color: var(--text); }
+.org-thumbs { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; margin-top: 8px; }
+.org-thumb { aspect-ratio: 1; border-radius: 8px; overflow: hidden; background: var(--surface-2); display: grid; place-items: center; color: var(--muted); }
+.org-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.org-thumb.more { font-size: .8rem; font-weight: 600; }
+.org-actions { position: sticky; bottom: calc(12px + var(--safe-b)); display: grid; margin-top: 8px; }
+.org-actions .btn { padding: 14px; box-shadow: var(--shadow); }

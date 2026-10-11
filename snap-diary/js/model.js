@@ -84,6 +84,16 @@ export function createPhoto({ width, height, kind = "photo", name = "", mime = "
   return photo;
 }
 
+/** Copies capture info ({ takenAt, lat, lng } from exif.js) onto a photo, rounded to ~1 m. */
+export function applyCaptureInfo(photo, info) {
+  if (info?.source && info.source !== "file" && info.takenAt) photo.takenAt = info.takenAt;
+  if (Number.isFinite(info?.lat) && Number.isFinite(info?.lng)) {
+    photo.lat = Math.round(info.lat * 1e5) / 1e5;
+    photo.lng = Math.round(info.lng * 1e5) / 1e5;
+  }
+  return photo;
+}
+
 export const isVideo = (photo) => photo?.kind === "video";
 
 export function isEntryEmpty(entry) {
@@ -113,6 +123,13 @@ function cleanPhoto(p) {
     depthDriveId: p.depthDriveId || null,
     depthSource: p.depthSource === "ai" || p.depthSource === "heuristic" ? p.depthSource : null
   };
+  // Capture metadata read from the original file (kept: it is the diary's own data).
+  if (typeof p.takenAt === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(p.takenAt)) clean.takenAt = p.takenAt;
+  if (Number.isFinite(p.lat) && Number.isFinite(p.lng) && Math.abs(p.lat) <= 90 && Math.abs(p.lng) <= 180) {
+    clean.lat = p.lat;
+    clean.lng = p.lng;
+  }
+  if (typeof p.placeName === "string" && p.placeName.trim()) clean.placeName = p.placeName.trim().slice(0, 80);
   if (clean.kind === "video") {
     clean.mime = typeof p.mime === "string" && p.mime.startsWith("video/") ? p.mime : "video/mp4";
     clean.duration = Number.isFinite(p.duration) && p.duration >= 0 ? p.duration : null;

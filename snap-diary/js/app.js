@@ -6,11 +6,14 @@ import { createSync } from "./sync.js";
 import { commitEdit, deleteEntry, attachDepth, visibleEntries } from "./repo.js";
 import {
   createEntry, createPhoto, groupByMonth, formatKoreanDate, excerpt, matchesQuery, MOODS,
-  monthGrid, toISODate, isEntryEmpty, sortEntries, formatMonth, isISODate, isVideo
+  monthGrid, toISODate, isEntryEmpty, sortEntries, formatMonth, isISODate, isVideo, applyCaptureInfo
 } from "./model.js";
-import { preparePhoto, decodeImage } from "./images.js";
+import { preparePhoto, decodeImage, photoSize, setPhotoSize } from "./images.js";
 import { prepareVideo } from "./video.js";
 import { isVideoFile, formatDuration } from "./media.js";
+import { readCaptureInfo } from "./exif.js";
+import { regionName, geocodeEnabled, setGeocodeEnabled, ATTRIBUTION } from "./geocode.js";
+import { planDays, distinctNames, googlePhotosDayUrl } from "./organize.js";
 import { estimateDepth, depthToBlob, blobToDepth } from "./depth.js";
 import { createPlaceViewer } from "./place3d.js";
 import { h, icon, clear, toast, confirmSheet, urlScope, formatTime, formatBytes } from "./ui.js";
@@ -81,6 +84,35 @@ function photoImg(photo, scope, { kind = "thumb", cls = "" } = {}) {
   });
   return wrap;
 }
+
+// ---------- importing picked files ----------
+
+/**
+ * Reads capture time/GPS from the original file (before re-encoding strips
+ * it), stores the diary copy + thumbnail locally and returns the attachment.
+ */
+async function importMedia(file, kind) {
+  const info = await readCaptureInfo(file);
+  let photo, notice = "";
+  if (isVideoFile(file)) {
+    if (kind === "place") notice = "동영상은 3D 장소로 만들 수 없어 동영상으로 추가했어요.";
+    const prepared = await prepareVideo(file);
+    photo = createPhoto({ width: prepared.width, height: prepared.height, kind: "video", name: file.name || "",
+      mime: prepared.mime, duration: prepared.duration, size: prepared.size });
+    await db.blobs.put(`photo:${photo.id}`, prepared.video);
+    await db.blobs.put(`thumb:${photo.id}`, prepared.poster);
+    if (!prepared.playable) notice = "이 기기에서는 미리보기가 안 되는 형식이지만 그대로 저장해요.";
+  } else {
+    const prepared = await preparePhoto(file);
+    photo = createPhoto({ width: prepared.width, height: prepared.height, kind, name: file.name || "" });
+    await db.blobs.put(`photo:${photo.id}`, prepared.full);
+    await db.blobs.put(`thumb:${photo.id}`, prepared.thumb);
+  }
+  applyCaptureInfo(photo, info);
+  return { photo, info, notice };
+}
+
+const placeLookup = (lat, lng) => regionName(lat, lng, db.meta);
 
 // ---------- depth jobs (one at a time; the AI model is memory hungry) ----------
 
@@ -232,7 +264,8 @@ const ROUTES = [
   [/^#\/entry\/([a-z0-9]+)$/, (m) => screenEntry(m[1]), "home"],
   [/^#\/edit\/([a-z0-9]+)$/, (m) => screenEditor({ id: m[1] }), null],
   [/^#\/new(?:\/(\d{4}-\d{2}-\d{2}))?$/, (m) => screenEditor({ date: m[1] }), null],
-  [/^#\/view\/([a-z0-9]+)\/([a-z0-9]+)$/, (m) => screenViewer(m[1], m[2]), null]
+  [/^#\/view\/([a-z0-9]+)\/([a-z0-9]+)$/, (m) => screenViewer(m[1], m[2]), null],
+  [/^#\/organize$/, () => screenOrganize(), null]
 ];
 
 let ctx = null;
@@ -322,7 +355,8 @@ async function screenTimeline() {
       list.append(h("div", { class: "empty" },
         h("div", { class: "empty-art", "aria-hidden": "true" }),
         h("p", { text: "아직 기록이 없어요." }),
-        h("p", { class: "muted", text: "＋를 눌러 오늘 한 일을 남겨 보세요." })));
+        h("p", { class: "muted", text: "＋를 눌러 오늘 한 일을 남겨 보세요." }),
+        h("a", { class: "btn accent", href: "#/organize" }, icon("sparkle", 18), "휴대폰 사진으로 날짜별 정리하기")));
       return;
     }
     if (!filtered.length) {
@@ -341,7 +375,7 @@ async function screenTimeline() {
   });
   paint("");
   return h("div", { class: "screen" },
-    topBar("나의 기록"),
+    topBar("나의 기록", { actions: [h("a", { class: "btn ghost small", href: "#/organize" }, icon("sparkle", 16), "사진으로 정리")] }),
     all.length ? h("label", { class: "search-wrap" }, icon("search", 18), search) : null,
     list);
 }
@@ -367,6 +401,7 @@ async function screenEntry(id) {
     scheduleSync(300);
     go("#/");
   };
+  const visited = distinctNames(entry.photos.map((p) => p.placeName)).filter((n) => n !== entry.place?.name);
   const mapLink = entry.place && Number.isFinite(entry.place.lat)
     ? `https://www.google.com/maps/search/?api=1&query=${entry.place.lat},${entry.place.lng}` : null;
   return h("article", { class: "screen entry" },
@@ -384,6 +419,8 @@ async function screenEntry(id) {
       ? h(mapLink ? "a" : "span", { class: "chip place-chip", href: mapLink, target: mapLink ? "_blank" : null, rel: "noopener" },
         icon("place", 16), entry.place?.name || `${entry.place.lat.toFixed(4)}, ${entry.place.lng.toFixed(4)}`)
       : null,
+    visited.length ? h("div", { class: "chip-row" }, h("span", { class: "muted small", text: "이날 다녀온 곳" }),
+      visited.map((name) => h("span", { class: "chip" }, icon("place", 14), name))) : null,
     places.map((p) => h("a", { class: "place-card", href: `#/view/${id}/${p.id}` },
       photoImg(p, scope, { kind: "photo" }),
       h("span", { class: "badge-3d" }, icon("cube", 16), "3D로 보기"),
@@ -393,6 +430,8 @@ async function screenEntry(id) {
       h("button", { class: "photo-cell", "aria-label": p.caption || (isVideo(p) ? "동영상 재생" : "사진 크게 보기"),
         onclick: () => (isVideo(p) ? videoPlayer(p) : lightbox(p)) },
         photoImg(p, scope), p.caption ? h("span", { class: "caption", text: p.caption }) : null))) : null,
+    entry.photos.length ? h("a", { class: "btn ghost small gphotos", href: googlePhotosDayUrl(entry.date), target: "_blank", rel: "noopener" },
+      icon("photo", 16), "구글 포토에서 이날 원본 찾기") : null,
     h("p", { class: "muted small", text: entry.sync?.dirty ? "이 기기에만 저장됨 · 동기화 대기" : `Google Drive에 저장됨` }));
 }
 
@@ -466,8 +505,41 @@ async function screenEditor({ id, date }) {
   const textArea = h("textarea", { class: "text-input", placeholder: "오늘 어떤 일을 했나요?", value: draft.text, rows: 8,
     oninput: (e) => { draft.text = e.target.value; markDirty(); grow(); } });
   const grow = () => { textArea.style.height = "auto"; textArea.style.height = `${Math.max(180, textArea.scrollHeight)}px`; };
+  let dateTouched = false;
   const dateInput = h("input", { type: "date", value: draft.date, max: "9999-12-31",
-    onchange: (e) => { if (isISODate(e.target.value)) { draft.date = e.target.value; markDirty(); } } });
+    onchange: (e) => {
+      if (isISODate(e.target.value)) { draft.date = e.target.value; dateTouched = true; markDirty(); dateHint.hidden = true; }
+    } });
+  const dateHint = h("div", { class: "hint-banner", hidden: true });
+  const showDateHint = (date) => {
+    clear(dateHint).append(icon("calendar", 18),
+      h("span", { text: `사진을 찍은 날은 ${formatKoreanDate(date, { withYear: false })}이에요.` }),
+      h("button", { type: "button", class: "btn small accent", text: "그날 기록으로", onclick: () => {
+        draft.date = date;
+        dateInput.value = date;
+        dateTouched = true;
+        markDirty();
+        dateHint.hidden = true;
+      } }));
+    dateHint.hidden = false;
+  };
+  /** Capture metadata fills the date suggestion and the place, never overriding what you typed. */
+  function useCaptureInfo(photo, info) {
+    if (isNew && !dateTouched && info.source !== "file" && info.date && info.date !== draft.date) showDateHint(info.date);
+    if (!Number.isFinite(photo.lat)) return;
+    placeLookup(photo.lat, photo.lng).then((label) => { if (label) photo.placeName = label; });
+    const hasPlace = draft.place?.name?.trim() || Number.isFinite(draft.place?.lat);
+    if (hasPlace) return;
+    draft.place = { name: "", lat: photo.lat, lng: photo.lng };
+    markDirty();
+    paintCoords();
+    placeLookup(photo.lat, photo.lng).then((label) => {
+      if (label && !placeInput.value.trim() && draft.place && !draft.place.name) {
+        draft.place.name = label;
+        placeInput.value = label;
+      }
+    });
+  }
   const moods = h("div", { class: "moods", role: "group", "aria-label": "기분" }, MOODS.map((m) =>
     h("button", { type: "button", class: `mood-btn ${draft.mood === m ? "on" : ""}`, text: m, "aria-pressed": String(draft.mood === m),
       onclick: (e) => {
@@ -554,22 +626,10 @@ async function screenEditor({ id, date }) {
         h("span", { class: "muted small", text: video ? "동영상 준비 중…" : "사진 준비 중…" }));
       tiles.append(placeholder);
       try {
-        let photo;
-        if (video) {
-          if (kind === "place") toast("동영상은 3D 장소로 만들 수 없어 동영상으로 추가했어요.");
-          const prepared = await prepareVideo(file);
-          photo = createPhoto({ width: prepared.width, height: prepared.height, kind: "video", name: file.name || "",
-            mime: prepared.mime, duration: prepared.duration, size: prepared.size });
-          await db.blobs.put(`photo:${photo.id}`, prepared.video);
-          await db.blobs.put(`thumb:${photo.id}`, prepared.poster);
-          if (!prepared.playable) toast("이 기기에서는 미리보기가 안 되는 형식이지만 그대로 저장해요.");
-        } else {
-          const prepared = await preparePhoto(file);
-          photo = createPhoto({ width: prepared.width, height: prepared.height, kind, name: file.name || "" });
-          await db.blobs.put(`photo:${photo.id}`, prepared.full);
-          await db.blobs.put(`thumb:${photo.id}`, prepared.thumb);
-        }
+        const { photo, info, notice } = await importMedia(file, kind);
+        if (notice) toast(notice);
         if (finished) { await db.removePhotoBlobs(photo.id); return; }
+        useCaptureInfo(photo, info);
         added.add(photo.id);
         editorPhotoIds.add(photo.id);
         draft.photos.push(photo);
@@ -640,6 +700,7 @@ async function screenEditor({ id, date }) {
       actions: [h("button", { class: "btn primary small", text: "저장", onclick: save })]
     }),
     h("div", { class: "field-row" }, h("label", { class: "field" }, h("span", { text: "날짜" }), dateInput), moods),
+    dateHint,
     titleInput,
     textArea,
     h("div", { class: "field place-field" }, icon("place", 18), placeInput, locate),
@@ -831,6 +892,143 @@ async function screenViewer(entryId, photoId) {
   return root;
 }
 
+async function screenOrganize() {
+  const scope = ctx.scope;
+  const myCtx = ctx;
+  const status = h("p", { class: "organize-status muted small", "aria-live": "polite" });
+  const plan = h("div", { class: "organize-plan" });
+  let running = false;
+  const input = h("input", { type: "file", accept: "image/*,video/*,.heic,.heif", multiple: true, class: "hidden",
+    onchange: (e) => { const files = [...e.target.files]; e.target.value = ""; if (files.length) analyse(files); } });
+  const pickBtn = h("button", { class: "btn accent", onclick: () => input.click() }, icon("photo", 18), "사진·동영상 고르기");
+  const alive = () => ctx === myCtx;
+
+  async function analyse(files) {
+    if (running) return;
+    running = true;
+    pickBtn.disabled = true;
+    clear(plan);
+    try {
+      const items = [];
+      for (const [i, file] of files.entries()) {
+        status.textContent = `촬영 정보 읽는 중 ${i + 1}/${files.length}`;
+        items.push({ id: `i${i}`, file, info: await readCaptureInfo(file) });
+        if (!alive()) return;
+      }
+      const days = planDays(items, visibleEntries(await db.entries.all()));
+      const places = days.flatMap((d) => d.places);
+      for (const [i, place] of places.entries()) {
+        status.textContent = geocodeEnabled() ? `지역 이름 찾는 중 ${i + 1}/${places.length}` : "";
+        place.name = await placeLookup(place.lat, place.lng);
+        if (!alive()) return;
+      }
+      const withGps = items.filter((it) => Number.isFinite(it.info.lat)).length;
+      const exact = items.filter((it) => it.info.source && it.info.source !== "file").length;
+      status.textContent = `${files.length}개 중 촬영 날짜 ${exact}개, 위치 ${withGps}개를 찾았어요.`;
+      renderPlan(days);
+    } finally {
+      running = false;
+      pickBtn.disabled = false;
+    }
+  }
+
+  function preview(item) {
+    const tile = h("div", { class: "org-thumb" });
+    if (isVideoFile(item.file)) tile.append(icon("play", 20));
+    else {
+      const img = h("img", { alt: "", loading: "lazy", decoding: "async" });
+      img.addEventListener("error", () => { img.remove(); tile.append(h("span", { class: "small", text: "HEIC" })); }, { once: true });
+      img.src = scope.url(item.file);
+      tile.append(img);
+    }
+    return tile;
+  }
+
+  function renderPlan(days) {
+    clear(plan);
+    if (!days.length) {
+      plan.append(h("p", { class: "empty muted", text: "날짜를 알 수 있는 사진이 없어요." }));
+      return;
+    }
+    const rows = days.map((day) => {
+      const main = day.places[0];
+      const check = h("input", { type: "checkbox", checked: true, "aria-label": `${day.date} 포함` });
+      const name = h("input", { class: "org-place", value: main?.name || "", placeholder: main ? "지역 이름" : "장소 (선택)", maxlength: 60 });
+      const others = distinctNames(day.places.slice(1).map((p) => p.name)).filter((n) => n !== main?.name);
+      const card = h("div", { class: "org-day" },
+        h("label", { class: "org-head" }, check,
+          h("strong", { text: formatKoreanDate(day.date) }),
+          day.guessed ? h("span", { class: "chip", text: "날짜 추정" }) : null,
+          h("span", { class: "muted small", text: `${day.items.length}개` })),
+        h("div", { class: "org-place-row" }, icon("place", 16), name),
+        others.length ? h("p", { class: "muted small", text: `그 밖에: ${others.join(", ")}` }) : null,
+        day.entryId ? h("p", { class: "muted small", text: "이날 쓴 기록에 사진을 더해요." }) : null,
+        h("div", { class: "org-thumbs" }, day.items.slice(0, 6).map(preview),
+          day.items.length > 6 ? h("div", { class: "org-thumb more", text: `+${day.items.length - 6}` }) : null));
+      check.addEventListener("change", () => card.classList.toggle("off", !check.checked));
+      return { day, check, name, card };
+    });
+    const confirmBtn = h("button", { class: "btn primary", onclick: () => commit(rows) }, icon("sparkle", 18),
+      `${days.length}일치 기록으로 정리하기`);
+    plan.append(...rows.map((r) => r.card), h("div", { class: "org-actions" }, confirmBtn));
+  }
+
+  async function commit(rows) {
+    const chosen = rows.filter((r) => r.check.checked);
+    if (!chosen.length || running) return;
+    running = true;
+    clear(plan);
+    const total = chosen.reduce((n, r) => n + r.day.items.length, 0);
+    let done = 0, failed = 0;
+    try {
+      for (const { day, name } of chosen) {
+        const label = name.value.trim();
+        const main = day.places[0];
+        const placeOf = new Map(day.places.flatMap((p) => p.items.map((id) => [id, p.name])));
+        const photos = [];
+        for (const item of day.items) {
+          status.textContent = `사진 정리 중 ${++done}/${total}`;
+          try {
+            const { photo } = await importMedia(item.file, "photo");
+            if (placeOf.get(item.id)) photo.placeName = placeOf.get(item.id);
+            photos.push(photo);
+          } catch (error) {
+            failed++;
+            console.warn("[Snap Diary] skipped a file", item.file.name, error);
+          }
+        }
+        if (!photos.length) continue;
+        const place = label || main ? { name: label, lat: main?.lat ?? null, lng: main?.lng ?? null } : null;
+        const stored = day.entryId ? await db.entries.get(day.entryId) : null;
+        if (stored && !stored.sync?.deleted) {
+          const next = structuredClone(stored);
+          next.photos.push(...photos);
+          if (!next.place?.name && place) next.place = place;
+          await commitEdit(store, next);
+        } else {
+          const entry = createEntry({ date: day.date });
+          entry.photos = photos;
+          entry.place = place;
+          await commitEdit(store, entry);
+        }
+      }
+    } finally {
+      running = false;
+    }
+    toast(failed ? `${chosen.length}일치 정리 완료 · ${failed}개는 열 수 없어 건너뛰었어요.` : `${chosen.length}일치 기록으로 정리했어요.`, { ms: 3500 });
+    scheduleSync(500);
+    if (alive()) go("#/");
+  }
+
+  return h("div", { class: "screen organize" },
+    topBar("사진으로 정리", { back: () => (history.length > 1 ? history.back() : go("#/")) }),
+    h("p", { class: "lead muted", text: "휴대폰에서 사진·동영상을 고르면 찍은 날짜와 위치(GPS)를 읽어 날짜별 기록으로 정리해요. 이미 그날 쓴 기록이 있으면 거기에 더해요." }),
+    h("p", { class: "muted small", text: `다이어리에는 ${photoSize() === "large" ? "고화질(2560px)" : "작은(1280px)"} 사본이 저장되고, 원본은 휴대폰·구글 포토에 그대로 있어요.` }),
+    h("div", { class: "btn-row" }, pickBtn, input),
+    status, plan,
+    geocodeEnabled() ? h("p", { class: "muted small about", text: `${ATTRIBUTION} · 위치는 약 100 m 단위로만 보내요.` }) : null);
+}
+
 async function screenSettings() {
   const account = auth.account();
   const connected = Boolean(auth.cachedToken());
@@ -898,6 +1096,15 @@ async function screenSettings() {
         h("span", { class: "small", text: "승인된 리디렉션 URI" }),
         h("button", { class: "mono copy", text: auth.redirectUri(), onclick: () => copy(auth.redirectUri()) })),
       h("label", { class: "settings-row" }, h("span", { text: "로그인 방식" }), modeSelect)),
+    section("사진 · 위치",
+      h("label", { class: "settings-row" }, h("span", { text: "다이어리에 저장할 사진 크기" }),
+        h("select", { onchange: (e) => { setPhotoSize(e.target.value); toast("이제부터 추가하는 사진에 적용돼요."); } },
+          h("option", { value: "small", text: "작은 사본 1280px (추천)", selected: photoSize() === "small" }),
+          h("option", { value: "large", text: "고화질 2560px", selected: photoSize() === "large" }))),
+      h("label", { class: "settings-row toggle" },
+        h("span", {}, "사진 위치로 지역 이름 찾기",
+          h("small", { class: "muted", text: "사진의 GPS를 약 100 m 단위로 OpenStreetMap에 보내 ‘서울 성동구 성수동’ 같은 이름을 받아요. 끄면 좌표만 저장해요." })),
+        h("input", { type: "checkbox", checked: geocodeEnabled(), onchange: (e) => setGeocodeEnabled(e.target.checked) }))),
     section("3D 장소 사진",
       h("label", { class: "settings-row toggle" },
         h("span", {}, "AI 깊이 추정 사용",

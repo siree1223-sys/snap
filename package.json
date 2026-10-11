@@ -5,7 +5,7 @@
   "description": "Offline Google Meet camera effect Chrome extension",
   "scripts": {
     "test": "node validation/test-extension.cjs && node validation/test-background.cjs && node validation/test-gesture.cjs && node validation/test-dust.cjs",
-    "test:diary": "node --test validation/diary/test-units.mjs validation/diary/test-sync.mjs",
+    "test:diary": "node --test validation/diary/test-units.mjs validation/diary/test-sync.mjs validation/diary/test-capture.mjs",
     "build:diary": "python3 scripts/build-diary.py",
     "test:diary:e2e": "python3 scripts/build-diary.py && node validation/diary/test-e2e.mjs"
   },
