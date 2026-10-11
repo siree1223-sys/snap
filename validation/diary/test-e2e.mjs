@@ -405,7 +405,7 @@ try {
       return route.fulfill({ status: 302, headers: { location: `${q.get("redirect_uri")}#${hash}` } });
     });
     await E.page.goto(`${ORIGIN}/#/settings`);
-    await E.page.locator("select").selectOption("redirect");
+    await E.page.locator("select", { has: E.page.locator('option[value="redirect"]') }).selectOption("redirect");
     forge = true;
     await E.page.getByRole("button", { name: /Google 계정 연결/ }).click();
     await E.page.waitForFunction(() => /확인할 수 없습니다/.test(document.getElementById("toast")?.textContent || ""));
@@ -537,6 +537,113 @@ try {
     await G.context.close();
     assert.deepEqual(F.errors, []);
     await F.context.close();
+  });
+
+  await step("organize picked photos into dated entries by capture date and GPS region", async () => {
+    const H = await newDevice(browser, { config: { googleClientId: CLIENT_ID, allowedEmails: [], driveFolderName: "Snap Diary" } });
+    const geocodes = [];
+    const REGIONS = [
+      [37.5, 127.0, { quarter: "성수2가3동", suburb: "성수동2가", borough: "성동구", city: "서울", country: "대한민국", country_code: "kr" }],
+      [33.4, 126.9, { village: "성산리", town: "성산읍", city: "서귀포시", province: "제주특별자치도", country_code: "kr" }],
+      [35.1, 129.1, { suburb: "우동", borough: "해운대구", city: "부산광역시", country_code: "kr" }]
+    ];
+    await H.context.route("https://nominatim.openstreetmap.org/**", (route) => {
+      const q = new URL(route.request().url()).searchParams;
+      geocodes.push(`${q.get("lat")},${q.get("lon")}`);
+      const lat = Number(q.get("lat")), lon = Number(q.get("lon"));
+      const hit = REGIONS.find(([a, b]) => Math.abs(lat - a) < 0.2 && Math.abs(lon - b) < 0.2);
+      return route.fulfill({ status: 200, headers: { ...CORS, "content-type": "application/json" },
+        body: JSON.stringify({ address: hit ? hit[2] : {} }) });
+    });
+    // An entry already written on Oct 5: the Jeju photo should join it.
+    await H.page.goto(`${ORIGIN}/#/new/2026-10-05`);
+    await H.page.locator(".text-input").fill("제주 둘째 날");
+    await H.page.locator(".editor .screen-head .btn.primary").click();
+    await H.page.waitForSelector(".screen.entry");
+
+    await H.page.goto(`${ORIGIN}/#/`);
+    await H.page.getByRole("link", { name: "사진으로 정리" }).click();
+    await H.page.waitForSelector(".screen.organize");
+    const fx = (name, mimeType = "") => ({ name, mimeType, buffer: fs.readFileSync(path.join(here, "fixtures", name)) });
+    await H.page.locator(".organize input[type=file]").setInputFiles([
+      fx("seongsu.jpg", "image/jpeg"), fx("seongsu-evening.heic"), fx("jeju.jpg", "image/jpeg"),
+      fx("haeundae.mp4", "video/mp4"), fx("noexif.jpg", "image/jpeg")]);
+    await H.page.waitForSelector(".org-day", { timeout: 30000 });
+    const days = await H.page.locator(".org-day").evaluateAll((cards) => cards.map((c) => ({
+      date: c.querySelector("strong").textContent, place: c.querySelector(".org-place").value,
+      count: c.querySelector(".org-head .muted").textContent, guessed: Boolean(c.querySelector(".chip")),
+      merges: /기록에 사진을 더해요/.test(c.textContent) })));
+    const today = await H.page.evaluate(() => new Date().getFullYear());
+    assert.deepEqual(days.filter((d) => !d.guessed), [
+      { date: "2026년 10월 5일 (월)", place: "제주 서귀포시 성산읍", count: "1개", guessed: false, merges: true },
+      { date: "2026년 10월 4일 (일)", place: "부산 해운대구 우동", count: "1개", guessed: false, merges: false },
+      { date: "2026년 10월 3일 (토)", place: "서울 성동구 성수동", count: "2개", guessed: false, merges: false }
+    ], "days (newest first) from EXIF/HEIC/MP4 metadata, regions from GPS");
+    const guessedDay = days.find((d) => d.guessed);
+    assert.ok(guessedDay && guessedDay.date.startsWith(`${today}년`), "a photo without metadata is shown as a guessed date");
+    assert.equal(geocodes.length, 3, "one lookup per place (the two Seongsu photos are one place)");
+    assert.ok(geocodes.every((g) => /^-?\d+\.\d{3},-?\d+\.\d{3}$/.test(g)), `rounded positions only: ${geocodes}`);
+    assert.match(await H.page.locator(".organize-status").innerText(), /5개 중 촬영 날짜 4개, 위치 4개/);
+    // Leave out the guessed day.
+    await H.page.locator(".org-day", { hasText: "날짜 추정" }).locator("input[type=checkbox]").uncheck();
+    await H.page.getByRole("button", { name: /일치 기록으로 정리하기/ }).click();
+    await H.page.waitForSelector(".timeline", { timeout: 60000 });
+
+    const entries = await H.page.evaluate(async () => (await globalThis.__snapDiary.db.entries.all())
+      .map((e) => ({ date: e.date, text: e.text, place: e.place?.name || "", photos: e.photos.map((p) =>
+        ({ kind: p.kind, takenAt: p.takenAt || null, placeName: p.placeName || null, gps: Number.isFinite(p.lat) })) }))
+      .sort((a, b) => (a.date < b.date ? -1 : 1)));
+    assert.deepEqual(entries.map((e) => [e.date, e.place, e.photos.length]), [
+      ["2026-10-03", "서울 성동구 성수동", 2],
+      ["2026-10-04", "부산 해운대구 우동", 1],
+      ["2026-10-05", "제주 서귀포시 성산읍", 1]
+    ], "three entries; Oct 5 reused the existing one");
+    assert.equal(entries[2].text, "제주 둘째 날", "existing text kept");
+    assert.deepEqual(entries[0].photos.map((p) => p.takenAt), ["2026-10-03T14:22:05", "2026-10-03T18:40:00"]);
+    assert.ok(entries[0].photos.every((p) => p.gps && p.placeName === "서울 성동구 성수동"));
+    assert.equal(entries[1].photos[0].kind, "video");
+
+    await H.page.locator(".card", { hasText: "서울 성동구 성수동" }).click();
+    await H.page.waitForSelector(".screen.entry");
+    const link = await H.page.locator("a.gphotos").getAttribute("href");
+    assert.equal(link, "https://photos.google.com/search/" + encodeURIComponent("2026년 10월 3일"));
+    assert.deepEqual(H.errors, []);
+    await H.context.close();
+  });
+
+  await step("the editor offers the photo's capture date and fills the place; photos are kept as small copies", async () => {
+    const I = await newDevice(browser);
+    await I.context.route("https://nominatim.openstreetmap.org/**", (route) => route.fulfill({
+      status: 200, headers: { ...CORS, "content-type": "application/json" },
+      body: JSON.stringify({ address: { suburb: "성수동2가", borough: "성동구", city: "서울특별시", country_code: "kr" } }) }));
+    await I.page.goto(`${ORIGIN}/#/new`);
+    const inputs = I.page.locator(".photo-actions input[type=file]");
+    await inputs.nth(0).setInputFiles({ name: "seongsu.jpg", mimeType: "image/jpeg",
+      buffer: fs.readFileSync(path.join(here, "fixtures", "seongsu.jpg")) });
+    await I.page.waitForSelector(".hint-banner:not([hidden])");
+    assert.match(await I.page.locator(".hint-banner").innerText(), /사진을 찍은 날은 10월 3일 \(토\)이에요/);
+    await I.page.waitForFunction(() => document.querySelector(".place-field input").value === "서울 성동구 성수동");
+    assert.match(await I.page.locator(".editor .muted.small").first().innerText(), /37\.544\d, 127\.056\d/);
+    await I.page.getByRole("button", { name: "그날 기록으로" }).click();
+    assert.equal(await I.page.locator("input[type=date]").inputValue(), "2026-10-03");
+    await inputs.nth(0).setInputFiles({ name: "big.png", mimeType: "image/png", buffer: plainPhoto(3000, 2000) });
+    await I.page.waitForFunction(() => document.querySelectorAll(".photo-tile:not(.pending)").length === 2);
+    await I.page.locator(".editor .screen-head .btn.primary").click();
+    await I.page.waitForSelector(".screen.entry");
+    const sizes = await I.page.evaluate(async () => {
+      const { db } = globalThis.__snapDiary;
+      const [entry] = await db.entries.all();
+      const out = [];
+      for (const p of entry.photos) {
+        const bmp = await createImageBitmap(await db.blobs.get(`photo:${p.id}`));
+        out.push([bmp.width, bmp.height]);
+      }
+      return { date: entry.date, place: entry.place.name, sizes: out };
+    });
+    assert.deepEqual(sizes, { date: "2026-10-03", place: "서울 성동구 성수동", sizes: [[640, 480], [1280, 853]] },
+      "small copies by default (1280 px), never upscaled");
+    assert.deepEqual(I.errors, []);
+    await I.context.close();
   });
 
   for (const device of [A, B]) assert.deepEqual(device.errors, [], "no page errors");
