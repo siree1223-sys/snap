@@ -45,6 +45,8 @@ jobs:
           npx playwright install --with-deps chromium
       - name: End-to-end browser test
         run: node validation/diary/test-e2e.mjs
+      - name: A new release reaches an installed app (GitHub Pages caching)
+        run: node validation/diary/test-update.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:

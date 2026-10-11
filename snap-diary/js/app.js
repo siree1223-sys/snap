@@ -1156,7 +1156,8 @@ async function screenSettings() {
         toast("이 기기의 기록을 지웠어요.");
         go("#/");
       } }))),
-    h("p", { class: "muted small about", text: `스냅 다이어리 ${CONFIG.appVersion} · 3D 그레인 렌더러는 Meet Vanish(/snap)의 먼지 효과에서 왔어요.` }));
+    h("div", { class: "btn-row center" }, h("button", { class: "btn ghost small", text: "앱 새로 불러오기 (최신 버전 받기)", onclick: reloadApp })),
+    h("p", { class: "muted small about", text: `스냅 다이어리 ${CONFIG.appVersion} · 기록은 그대로 두고 앱 화면만 새로 받아요. 3D 그레인 렌더러는 Meet Vanish(/snap)의 먼지 효과에서 왔어요.` }));
 }
 
 // calendar day with several entries scrolls to that day's list
@@ -1204,18 +1205,67 @@ function lockNow() {
   return locking;
 }
 
+function showUpdateBanner() {
+  if (document.getElementById("update-banner")) return;
+  document.body.append(h("div", { id: "update-banner", class: "update-banner", role: "status" },
+    h("span", { text: "새 버전이 준비됐어요." }),
+    h("button", { class: "btn small accent", text: "지금 적용", onclick: () => location.reload() })));
+}
+
 function registerServiceWorker() {
   if (!("serviceWorker" in navigator) || location.protocol === "file:") return;
+  // A page that was already controlled has an older version running. When the
+  // new release takes over, switch to it right away on list screens; while
+  // writing or viewing, offer it instead of interrupting.
+  const hadController = Boolean(navigator.serviceWorker.controller);
+  let reloading = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!hadController || reloading) return;
+    if (document.body.dataset.mode === "tabs" && !document.querySelector(".lock-screen, .backdrop, .lightbox")) {
+      reloading = true;
+      location.reload();
+    } else showUpdateBanner();
+  });
   navigator.serviceWorker.register("./sw.js").then((reg) => {
-    reg?.addEventListener?.("updatefound", () => {
-      const worker = reg.installing;
-      worker?.addEventListener("statechange", () => {
-        if (worker.state === "installed" && navigator.serviceWorker.controller) {
-          toast("새 버전이 준비됐어요. 앱을 다시 열면 적용됩니다.", { ms: 4000 });
-        }
-      });
+    // Home-screen apps are often resumed rather than reopened: check then too.
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) reg?.update?.().catch(() => {});
     });
   }).catch((error) => console.warn("[Snap Diary] service worker", error));
+}
+
+/**
+ * Fetches the latest release now (the diary itself is untouched). A newer
+ * release takes over through controllerchange; otherwise this release's
+ * offline files are re-downloaded past the browser's HTTP cache.
+ */
+async function reloadApp() {
+  const reg = await navigator.serviceWorker?.getRegistration?.().catch(() => null);
+  if (reg) {
+    await reg.update().catch(() => {});
+    const incoming = reg.installing || reg.waiting;
+    if (incoming) {
+      toast("새 버전을 받는 중이에요…");
+      await new Promise((resolve) => {
+        incoming.addEventListener("statechange", () => { if (incoming.state === "activated" || incoming.state === "redundant") resolve(); });
+        setTimeout(resolve, 20000);
+      });
+      location.reload(); // usually controllerchange has already reloaded
+      return;
+    }
+  }
+  try {
+    for (const key of await caches.keys()) {
+      if (!key.startsWith("snap-diary-shell-")) continue;
+      const cache = await caches.open(key);
+      for (const request of await cache.keys()) {
+        const response = await fetch(request.url, { cache: "reload" });
+        if (response.ok) await cache.put(request, response);
+      }
+    }
+  } finally {
+    location.reload();
+  }
 }
 
 async function start() {
@@ -1254,4 +1304,4 @@ start().catch((error) => {
 });
 
 // Test hook (used by the automated browser tests only).
-globalThis.__snapDiary = { route, runSync, db, syncer };
+globalThis.__snapDiary = { route, runSync, db, syncer, version: CONFIG.appVersion };
