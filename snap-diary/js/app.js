@@ -6,9 +6,11 @@ import { createSync } from "./sync.js";
 import { commitEdit, deleteEntry, attachDepth, visibleEntries } from "./repo.js";
 import {
   createEntry, createPhoto, groupByMonth, formatKoreanDate, excerpt, matchesQuery, MOODS,
-  monthGrid, toISODate, isEntryEmpty, sortEntries, formatMonth, isISODate
+  monthGrid, toISODate, isEntryEmpty, sortEntries, formatMonth, isISODate, isVideo
 } from "./model.js";
 import { preparePhoto, decodeImage } from "./images.js";
+import { prepareVideo } from "./video.js";
+import { isVideoFile, formatDuration } from "./media.js";
 import { estimateDepth, depthToBlob, blobToDepth } from "./depth.js";
 import { createPlaceViewer } from "./place3d.js";
 import { h, icon, clear, toast, confirmSheet, urlScope, formatTime, formatBytes } from "./ui.js";
@@ -63,12 +65,15 @@ async function mediaBlob(photo, kind) {
   return inflight.get(key);
 }
 async function thumbBlob(photo) {
-  return (await mediaBlob(photo, "thumb")) || (await mediaBlob(photo, "photo"));
+  const thumb = await mediaBlob(photo, "thumb");
+  if (thumb || isVideo(photo)) return thumb; // never fetch a whole video for a thumbnail
+  return mediaBlob(photo, "photo");
 }
 
 function photoImg(photo, scope, { kind = "thumb", cls = "" } = {}) {
   const img = h("img", { class: `ph ${cls}`, alt: photo.caption || "", decoding: "async", loading: "lazy" });
-  const wrap = h("div", { class: `ph-wrap loading ${cls}` }, img);
+  const wrap = h("div", { class: `ph-wrap loading ${cls}` }, img,
+    isVideo(photo) ? h("span", { class: "play-badge" }, icon("play", 14), formatDuration(photo.duration)) : null);
   (kind === "thumb" ? thumbBlob(photo) : mediaBlob(photo, kind)).then((blob) => {
     wrap.classList.remove("loading");
     if (blob) img.src = scope.url(blob);
@@ -157,6 +162,11 @@ function setChip(state, detail = "") {
 }
 
 function onSyncProgress(event) {
+  if (event.phase === "upload" && event.total > 0) {
+    const label = event.kind === "video" ? "동영상" : "파일";
+    setChip("syncing", `${label} 올리는 중 ${Math.floor((100 * event.loaded) / event.total)}%`);
+    return;
+  }
   if (event.phase === "pull" || event.phase === "push") {
     setChip("syncing", event.total > 1 ? `동기화 ${Math.min(event.done + 1, event.total)}/${event.total}` : "동기화 중");
   }
@@ -238,7 +248,7 @@ async function route({ keepScroll = false } = {}) {
     old.scope.revokeAll();
   }
   // Overlays (photo lightbox, sheets) belong to the screen being left.
-  document.querySelectorAll(".lightbox, .backdrop").forEach((node) => node.remove());
+  document.querySelectorAll(".lightbox, .backdrop").forEach((node) => (node.closeOverlay ? node.closeOverlay() : node.remove()));
   const hash = location.hash || "#/";
   const found = ROUTES.find(([re]) => re.test(hash)) || ROUTES[0];
   const match = found[0].exec(hash) || [];
@@ -284,6 +294,8 @@ function topBar(title, { back = null, actions = [] } = {}) {
 function entryCard(entry, scope) {
   const photos = entry.photos.slice(0, 3);
   const places = entry.photos.filter((p) => p.kind === "place").length;
+  const videos = entry.photos.filter(isVideo).length;
+  const stills = entry.photos.length - videos;
   return h("a", { class: "card", href: `#/entry/${entry.id}` },
     photos.length ? h("div", { class: `card-photos n${photos.length}` }, photos.map((p) => photoImg(p, scope))) : null,
     h("div", { class: "card-body" },
@@ -295,7 +307,8 @@ function entryCard(entry, scope) {
       entry.text ? h("p", { class: "excerpt", text: excerpt(entry.text, 110) }) : null,
       h("div", { class: "card-meta" },
         entry.place?.name ? h("span", { class: "chip" }, icon("place", 14), entry.place.name) : null,
-        entry.photos.length ? h("span", { class: "chip" }, icon("photo", 14), String(entry.photos.length)) : null,
+        stills ? h("span", { class: "chip" }, icon("photo", 14), String(stills)) : null,
+        videos ? h("span", { class: "chip" }, icon("play", 14), String(videos)) : null,
         places ? h("span", { class: "chip accent" }, icon("cube", 14), `3D ${places}`) : null)));
 }
 
@@ -377,9 +390,45 @@ async function screenEntry(id) {
       p.caption ? h("span", { class: "caption", text: p.caption }) : null)),
     entry.text ? h("div", { class: "entry-text", text: entry.text }) : null,
     others.length ? h("div", { class: "photo-grid" }, others.map((p) =>
-      h("button", { class: "photo-cell", "aria-label": p.caption || "사진 크게 보기", onclick: () => lightbox(p) },
+      h("button", { class: "photo-cell", "aria-label": p.caption || (isVideo(p) ? "동영상 재생" : "사진 크게 보기"),
+        onclick: () => (isVideo(p) ? videoPlayer(p) : lightbox(p)) },
         photoImg(p, scope), p.caption ? h("span", { class: "caption", text: p.caption }) : null))) : null,
     h("p", { class: "muted small", text: entry.sync?.dirty ? "이 기기에만 저장됨 · 동기화 대기" : `Google Drive에 저장됨` }));
+}
+
+function videoPlayer(photo) {
+  const scope = urlScope();
+  const status = h("div", { class: "player-status" }, h("div", { class: "spinner" }), h("span", { text: "동영상 불러오는 중…" }));
+  const video = h("video", { controls: true, playsInline: true, preload: "auto", class: "hidden" });
+  const close = () => {
+    video.pause();
+    video.removeAttribute("src");
+    box.remove();
+    scope.revokeAll();
+  };
+  const driveLink = photo.driveId ? `https://drive.google.com/file/d/${encodeURIComponent(photo.driveId)}/view` : null;
+  const fail = (message) => {
+    clear(status).append(h("p", { text: message }),
+      driveLink ? h("a", { class: "btn ghost small light", href: driveLink, target: "_blank", rel: "noopener" }, "Google Drive에서 열기") : null);
+    video.classList.add("hidden");
+  };
+  const box = h("div", { class: "lightbox player", role: "dialog", "aria-modal": "true",
+    onclick: (e) => { if (e.target === box) close(); } },
+    status, video, photo.caption ? h("p", { text: photo.caption }) : null,
+    h("button", { class: "icon-btn close", "aria-label": "닫기", onclick: close }, icon("close")));
+  box.closeOverlay = close;
+  document.body.append(box);
+  video.addEventListener("loadedmetadata", () => { status.remove(); video.classList.remove("hidden"); });
+  video.addEventListener("error", () => fail("이 기기의 브라우저가 이 동영상 형식을 재생하지 못해요."));
+  mediaBlob(photo, "photo").then((blob) => {
+    if (!box.isConnected) return;
+    if (!blob) {
+      fail(auth.cachedToken() ? "동영상을 받지 못했어요. 잠시 후 다시 시도하세요."
+        : "동영상은 Google Drive에 있어요. Drive를 연결하면 이 기기에서도 볼 수 있어요.");
+      return;
+    }
+    video.src = scope.url(blob);
+  });
 }
 
 async function lightbox(photo) {
@@ -478,7 +527,7 @@ async function screenEditor({ id, date }) {
     });
     const caption = h("input", { class: "caption-input", placeholder: "설명", value: photo.caption, maxlength: 120,
       oninput: (e) => { photo.caption = e.target.value; markDirty(); } });
-    const removeBtn = h("button", { type: "button", class: "icon-btn tiny remove", "aria-label": "사진 빼기",
+    const removeBtn = h("button", { type: "button", class: "icon-btn tiny remove", "aria-label": "첨부 빼기",
       onclick: async () => {
         draft.photos = draft.photos.filter((p) => p !== photo);
         markDirty();
@@ -490,7 +539,8 @@ async function screenEditor({ id, date }) {
         }
       } }, icon("close", 16));
     const node = h("div", { class: "photo-tile" }, photoImg(photo, scope), removeBtn,
-      h("div", { class: "tile-foot" }, kindBtn, caption, status));
+      h("div", { class: "tile-foot" }, isVideo(photo) ? null : kindBtn, caption, status));
+    if (isVideo(photo)) return node;
     paintKind();
     if (depthJobs.has(photo.id)) status.textContent = "3D 계산 중…";
     return node;
@@ -499,28 +549,43 @@ async function screenEditor({ id, date }) {
 
   async function addFiles(files, kind) {
     for (const file of files) {
-      const placeholder = h("div", { class: "photo-tile pending" }, h("span", { class: "muted small", text: "사진 준비 중…" }));
+      const video = isVideoFile(file);
+      const placeholder = h("div", { class: "photo-tile pending" },
+        h("span", { class: "muted small", text: video ? "동영상 준비 중…" : "사진 준비 중…" }));
       tiles.append(placeholder);
       try {
-        const prepared = await preparePhoto(file);
-        const photo = createPhoto({ width: prepared.width, height: prepared.height, kind, name: file.name || "" });
-        await db.blobs.put(`photo:${photo.id}`, prepared.full);
-        await db.blobs.put(`thumb:${photo.id}`, prepared.thumb);
+        let photo;
+        if (video) {
+          if (kind === "place") toast("동영상은 3D 장소로 만들 수 없어 동영상으로 추가했어요.");
+          const prepared = await prepareVideo(file);
+          photo = createPhoto({ width: prepared.width, height: prepared.height, kind: "video", name: file.name || "",
+            mime: prepared.mime, duration: prepared.duration, size: prepared.size });
+          await db.blobs.put(`photo:${photo.id}`, prepared.video);
+          await db.blobs.put(`thumb:${photo.id}`, prepared.poster);
+          if (!prepared.playable) toast("이 기기에서는 미리보기가 안 되는 형식이지만 그대로 저장해요.");
+        } else {
+          const prepared = await preparePhoto(file);
+          photo = createPhoto({ width: prepared.width, height: prepared.height, kind, name: file.name || "" });
+          await db.blobs.put(`photo:${photo.id}`, prepared.full);
+          await db.blobs.put(`thumb:${photo.id}`, prepared.thumb);
+        }
         if (finished) { await db.removePhotoBlobs(photo.id); return; }
         added.add(photo.id);
         editorPhotoIds.add(photo.id);
         draft.photos.push(photo);
         markDirty();
         placeholder.replaceWith(tile(photo));
-        if (kind === "place") queueDepth(draft.id, photo).catch(() => {});
+        if (photo.kind === "place") queueDepth(draft.id, photo).catch(() => {});
       } catch (error) {
         placeholder.remove();
         toast(error.message || "사진을 추가하지 못했어요.", { error: true });
       }
     }
   }
+  // HEIC/HEIF are listed explicitly: some Android pickers hide them under image/*.
   const picker = (kind) => {
-    const input = h("input", { type: "file", accept: "image/*", multiple: true, class: "hidden",
+    const accept = kind === "place" ? "image/*,.heic,.heif" : "image/*,video/*,.heic,.heif";
+    const input = h("input", { type: "file", accept, multiple: true, class: "hidden",
       onchange: (e) => { addFiles([...e.target.files], kind); e.target.value = ""; } });
     return input;
   };
@@ -580,10 +645,10 @@ async function screenEditor({ id, date }) {
     h("div", { class: "field place-field" }, icon("place", 18), placeInput, locate),
     coords,
     h("div", { class: "photo-actions" },
-      h("button", { type: "button", class: "btn ghost", onclick: () => photoInput.click() }, icon("photo", 18), "사진 추가"),
+      h("button", { type: "button", class: "btn ghost", onclick: () => photoInput.click() }, icon("photo", 18), "사진·동영상"),
       h("button", { type: "button", class: "btn accent", onclick: () => placeInput3d.click() }, icon("cube", 18), "장소 사진 (3D)"),
       photoInput, placeInput3d),
-    h("p", { class: "muted small hint", text: "장소 사진은 깊이를 추정해 3D 공간으로 만들어요. 다른 사진도 ‘3D로 만들기’로 바꿀 수 있어요." }),
+    h("p", { class: "muted small hint", text: "장소 사진은 깊이를 추정해 3D 공간으로 만들어요. 다른 사진도 ‘3D로 만들기’로 바꿀 수 있어요. HEIC 사진과 동영상(최대 1 GB)도 올릴 수 있어요." }),
     tiles);
 }
 
@@ -683,7 +748,10 @@ async function screenViewer(entryId, photoId) {
 
   let viewer = null;
   let gyroOn = false;
-  ctx.cleanups.push(() => viewer?.dispose());
+  ctx.cleanups.push(() => {
+    viewer?.dispose();
+    if (globalThis.__snapDiary?.viewer === viewer) globalThis.__snapDiary.viewer = null;
+  });
   const myCtx = ctx;
 
   (async () => {
@@ -720,6 +788,7 @@ async function screenViewer(entryId, photoId) {
     }
     status.remove();
     toolbar.hidden = false;
+    if (globalThis.__snapDiary) globalThis.__snapDiary.viewer = viewer;
   })().catch((error) => {
     if (ctx !== myCtx) return;
     status.classList.add("error");
@@ -768,6 +837,15 @@ async function screenSettings() {
   const lastSync = await db.meta.get("lastSync");
   const pending = await pendingCount();
   const estimate = await navigator.storage?.estimate?.().catch(() => null);
+  // Videos already safe in Drive can be dropped from this phone and re-downloaded when played.
+  const cachedVideos = [];
+  for (const entry of visibleEntries(await db.entries.all())) {
+    for (const photo of entry.photos.filter((p) => isVideo(p) && p.driveId)) {
+      const blob = await db.blobs.get(`photo:${photo.id}`);
+      if (blob) cachedVideos.push({ id: photo.id, size: blob.size });
+    }
+  }
+  const cachedVideoBytes = cachedVideos.reduce((n, v) => n + v.size, 0);
   const section = (title, ...children) => h("section", { class: "settings-section" }, h("h2", { text: title }), children);
   const row = (label, value) => h("div", { class: "settings-row" }, h("span", { text: label }), h("span", { class: "muted", text: value }));
 
@@ -844,6 +922,13 @@ async function screenSettings() {
       h("p", { class: "muted small", text: "PIN은 화면 잠금이에요. 이 기기 저장소를 암호화하지는 않습니다." })),
     section("이 기기",
       row("저장 공간", estimate ? `${formatBytes(estimate.usage)} 사용` : "-"),
+      cachedVideos.length ? h("div", { class: "btn-row" }, h("button", { class: "btn ghost small",
+        text: `Drive에 올라간 동영상 ${cachedVideos.length}개 이 기기에서 비우기 (${formatBytes(cachedVideoBytes)})`,
+        onclick: async () => {
+          for (const v of cachedVideos) await db.blobs.remove(`photo:${v.id}`);
+          toast("비웠어요. 재생하면 Drive에서 다시 받아요.");
+          route({ keepScroll: true });
+        } })) : null,
       standalone ? row("앱 설치", "설치됨") :
         app.installPrompt ? h("div", { class: "btn-row" }, h("button", { class: "btn accent", text: "홈 화면에 설치", onclick: async () => {
           app.installPrompt.prompt();

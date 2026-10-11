@@ -36,7 +36,8 @@ export function buildMultipart(metadata, media, boundary) {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export function createDriveClient(getToken, {
-  fetchImpl = (...a) => fetch(...a), retryDelay = 800, onUnauthorized = () => {}
+  fetchImpl = (...a) => fetch(...a), retryDelay = 800, onUnauthorized = () => {},
+  useXhr = typeof XMLHttpRequest !== "undefined"
 } = {}) {
   async function request(url, options = {}, { raw = false } = {}) {
     for (let attempt = 0; ; attempt++) {
@@ -104,6 +105,92 @@ export function createDriveClient(getToken, {
     return (await createFolder(name, parentId, { snapDiary: role })).id;
   }
 
+  // ---------- resumable upload (videos, anything over the multipart limit) ----------
+
+  /** One PUT to an upload session. XHR in browsers for upload progress. */
+  function put(url, body, headers, onProgress) {
+    if (useXhr) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("PUT", url);
+        for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value);
+        if (onProgress) xhr.upload.onprogress = (event) => onProgress(event.loaded);
+        xhr.onload = () => resolve({ status: xhr.status, header: (n) => xhr.getResponseHeader(n), text: xhr.responseText });
+        xhr.onerror = xhr.onabort = xhr.ontimeout = () => reject(new DriveError("업로드 연결이 끊겼습니다.", 0));
+        xhr.send(body);
+      });
+    }
+    return fetchImpl(url, { method: "PUT", headers, body }).then(async (response) => ({
+      status: response.status, header: (n) => response.headers.get(n), text: await response.text()
+    }));
+  }
+
+  async function startSession(metadata, blob) {
+    const response = await request(`${UPLOAD}/files?uploadType=resumable&fields=${FILE_FIELDS}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json; charset=UTF-8",
+        "X-Upload-Content-Type": blob.type || "application/octet-stream",
+        "X-Upload-Content-Length": String(blob.size)
+      },
+      body: JSON.stringify(metadata)
+    }, { raw: true });
+    const location = response.headers.get("Location");
+    if (location) return location;
+    // Google exposes X-GUploader-UploadID to browsers; the session URI is
+    // the upload endpoint plus that id, so it works even if Location is hidden.
+    const uploadId = response.headers.get("X-GUploader-UploadID");
+    if (uploadId) {
+      return `${UPLOAD}/files?uploadType=resumable&fields=${FILE_FIELDS}&upload_id=${encodeURIComponent(uploadId)}`;
+    }
+    throw new DriveError("업로드 세션을 시작할 수 없습니다.", response.status);
+  }
+
+  /**
+   * Uploads a file of any size. After an interruption it asks the session how
+   * many bytes arrived and continues from there; an expired session starts over.
+   */
+  async function uploadResumable(metadata, blob, { onProgress } = {}) {
+    const total = blob.size;
+    const done = (text) => {
+      onProgress?.(total, total);
+      return JSON.parse(text);
+    };
+    for (let session = 0; session < 2; session++) {
+      const url = await startSession(metadata, blob);
+      let offset = 0;
+      let expired = false;
+      for (let attempt = 0; attempt < 6 && !expired; attempt++) {
+        let result = null;
+        try {
+          result = await put(url, blob.slice(offset), {
+            "Content-Range": total ? `bytes ${offset}-${total - 1}/${total}` : "bytes */0"
+          }, (loaded) => onProgress?.(Math.min(total, offset + loaded), total));
+        } catch { /* interrupted: ask the session below */ }
+        if (result?.status === 200 || result?.status === 201) return done(result.text);
+        if (result?.status === 404 || result?.status === 410) break;
+        if (result && result.status >= 400 && result.status < 500 && ![408, 429].includes(result.status)) {
+          throw new DriveError(`업로드 실패 (${result.status})`, result.status);
+        }
+        await sleep(retryDelay * 2 ** Math.min(attempt, 4));
+        let status;
+        try {
+          status = await put(url, null, { "Content-Range": `bytes */${total}` });
+        } catch {
+          continue;
+        }
+        if (status.status === 200 || status.status === 201) return done(status.text);
+        if (status.status === 404 || status.status === 410) expired = true;
+        else if (status.status === 308) {
+          // No Range header means the session has received nothing yet.
+          const last = /bytes=0-(\d+)/.exec(status.header("Range") || "");
+          offset = last ? Number(last[1]) + 1 : 0;
+        }
+      }
+    }
+    throw new DriveError("파일을 올리지 못했습니다. 연결 상태를 확인하고 다시 동기화하세요.", 0);
+  }
+
   function boundary() {
     return `snapdiary${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
   }
@@ -127,6 +214,7 @@ export function createDriveClient(getToken, {
     ensureFolder,
     getFile: (fileId) => request(`${API}/files/${encodeURIComponent(fileId)}?fields=${FILE_FIELDS}`),
     createFile: (metadata, blob) => upload(metadata, blob, null),
+    uploadResumable,
     /** Metadata `parents` cannot be PATCHed on update; strip it. */
     updateFile: (fileId, metadata, blob) => {
       const { parents, ...rest } = metadata;

@@ -346,3 +346,15 @@ img.ph:not([src]) { visibility: hidden; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ---------- video ---------- */
+.play-badge {
+  position: absolute; left: 6px; bottom: 6px; z-index: 1; display: inline-flex; align-items: center; gap: 3px;
+  padding: 2px 7px 2px 5px; border-radius: 999px; background: rgba(12, 10, 18, .66); color: #fff; font-size: .72rem; font-weight: 600;
+}
+.play-badge .icon { fill: currentColor; stroke: none; }
+.chip .icon[viewBox] path[d^="M8 5.5"] { fill: currentColor; stroke: none; }
+.lightbox.player { gap: 12px; align-content: center; }
+.lightbox.player video { width: 100%; max-height: 80dvh; border-radius: 10px; background: #000; }
+.player-status { display: grid; justify-items: center; gap: 12px; text-align: center; color: #ddd; max-width: 320px; }
+.btn.light { color: #fff; border-color: rgba(255, 255, 255, .35); }

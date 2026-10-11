@@ -1,13 +1,33 @@
 // Photo decoding and re-encoding. Re-encoding through a canvas applies the
 // camera's EXIF rotation and strips EXIF metadata (including GPS) before
-// anything is uploaded.
+// anything is uploaded. HEIF/HEIC photos end up as JPEG the same way.
+
+import { CONFIG } from "./config.js";
+import { looksLikeHeif, isHeifName } from "./media.js";
 
 const FULL_MAX_SIDE = 2560;
 const THUMB_MAX_SIDE = 480;
 // Drive's simple multipart upload accepts up to 5 MB; stay comfortably below.
 export const MAX_UPLOAD_BYTES = 4.5 * 1024 * 1024;
 
-export async function decodeImage(blob) {
+let heicModule = null;
+/** libheif (WebAssembly) via heic-to, fetched only the first time a HEIC needs it. */
+function heicConverter() {
+  if (!heicModule) {
+    heicModule = import(/* @vite-ignore */ CONFIG.heicUrl).catch((error) => {
+      heicModule = null;
+      throw error;
+    });
+  }
+  return heicModule;
+}
+
+async function isHeif(blob) {
+  if (isHeifName(blob)) return true;
+  return looksLikeHeif(new Uint8Array(await blob.slice(0, 64).arrayBuffer()));
+}
+
+async function decodeNative(blob) {
   if (typeof createImageBitmap === "function") {
     try {
       return await createImageBitmap(blob, { imageOrientation: "from-image" });
@@ -20,10 +40,33 @@ export async function decodeImage(blob) {
     img.src = url;
     await img.decode();
     return img;
-  } catch {
-    throw new Error("이 사진 형식은 열 수 없습니다. JPG/PNG로 다시 선택해 주세요.");
   } finally {
     URL.revokeObjectURL(url);
+  }
+}
+
+/**
+ * Decodes JPEG/PNG/WebP/AVIF natively. HEIF/HEIC decodes natively where the
+ * browser can (Safari); elsewhere (Chrome on Android/desktop) it goes through
+ * libheif, with its rotation/mirroring applied.
+ */
+export async function decodeImage(blob) {
+  try {
+    return await decodeNative(blob);
+  } catch (nativeError) {
+    if (!(await isHeif(blob))) throw new Error("이 사진 형식은 열 수 없습니다. JPG/PNG/HEIC 사진을 선택해 주세요.");
+  }
+  let converter;
+  try {
+    converter = await heicConverter();
+  } catch {
+    throw new Error("HEIC 사진을 열려면 처음 한 번 인터넷 연결이 필요해요 (변환기 다운로드).");
+  }
+  try {
+    return await converter.heicTo({ blob, type: "bitmap" });
+  } catch (error) {
+    console.warn("[Snap Diary] HEIC decode failed", error);
+    throw new Error("이 HEIC 사진을 열 수 없습니다.");
   }
 }
 

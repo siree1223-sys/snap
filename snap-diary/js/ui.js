@@ -50,6 +50,7 @@ const ICONS = {
   reset: "M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5",
   lock: "M6 11h12v10H6zM8 11V8a4 4 0 0 1 8 0v3",
   locate: "M12 2v3M12 19v3M2 12h3M19 12h3M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10z",
+  play: "M8 5.5v13l11-6.5z",
   chevronL: "M15 18l-6-6 6-6",
   chevronR: "M9 18l6-6-6-6"
 };

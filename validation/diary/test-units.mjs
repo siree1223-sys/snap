@@ -13,6 +13,8 @@ import {
 import { heuristicDepth } from "../../snap-diary/js/depth.js";
 import { buildMultipart, quote } from "../../snap-diary/js/drive.js";
 import { parseMultipart } from "./fake-drive.mjs";
+import { looksLikeHeif, isHeifName, isVideoFile, videoMime, videoExtension, formatDuration } from "../../snap-diary/js/media.js";
+import { readFileSync } from "node:fs";
 
 const require = createRequire(import.meta.url);
 const meetVanishDust = require("../../meet-vanish-extension/dust-effect.js");
@@ -163,4 +165,54 @@ test("Drive multipart body and query escaping", async () => {
   assert.equal(parsed.mime, "image/jpeg");
   assert.deepEqual([...parsed.content], [0, 255, 13, 10, 45, 45], "binary survives byte-for-byte");
   assert.equal(quote("it's a \\ test"), "'it\\'s a \\\\ test'");
+});
+
+test("HEIF is recognised by content, AVIF and other formats are not", () => {
+  const heic = new Uint8Array(readFileSync(new URL("./fixtures/place.heic", import.meta.url)));
+  assert.ok(looksLikeHeif(heic.subarray(0, 64)), "real libheif-encoded HEIC");
+  const ftyp = (major, ...compatible) => {
+    const brands = [major, "\0\0\0\0", ...compatible].join("");
+    const size = 8 + brands.length;
+    return Uint8Array.from([0, 0, 0, size, ...Buffer.from("ftyp"), ...Buffer.from(brands, "latin1")]);
+  };
+  assert.ok(looksLikeHeif(ftyp("mif1", "mif1", "heic")), "Samsung-style mif1 major brand");
+  assert.ok(looksLikeHeif(ftyp("msf1", "msf1", "hevc")), "HEIF sequence (burst/live)");
+  assert.ok(!looksLikeHeif(ftyp("avif", "mif1", "miaf")), "AVIF");
+  assert.ok(!looksLikeHeif(ftyp("mif1", "mif1", "avif")), "AVIF listing mif1 first");
+  assert.ok(!looksLikeHeif(ftyp("isom", "isom", "mp41")), "MP4 video");
+  assert.ok(!looksLikeHeif(ftyp("qt  ", "qt  ")), "QuickTime video");
+  assert.ok(!looksLikeHeif(Uint8Array.from([0xff, 0xd8, 0xff, 0xe0, 0, 16, 74, 70, 73, 70, 0, 1, 1, 0, 0, 1])), "JPEG");
+  assert.ok(!looksLikeHeif(new Uint8Array(4)), "too short");
+  assert.ok(isHeifName({ name: "IMG_1234.HEIC", type: "" }));
+  assert.ok(isHeifName({ name: "x", type: "image/heif" }));
+  assert.ok(!isHeifName({ name: "a.jpg", type: "image/jpeg" }));
+});
+
+test("video files are recognised even without a MIME type (Android pickers)", () => {
+  assert.ok(isVideoFile({ name: "a.mp4", type: "video/mp4" }));
+  assert.ok(isVideoFile({ name: "IMG_0001.MOV", type: "" }));
+  assert.ok(isVideoFile({ name: "clip.webm", type: "application/octet-stream" }));
+  assert.ok(!isVideoFile({ name: "IMG_0001.HEIC", type: "" }));
+  assert.ok(!isVideoFile({ name: "photo.jpg", type: "image/jpeg" }));
+  assert.equal(videoMime({ name: "IMG_0001.MOV", type: "" }), "video/quicktime");
+  assert.equal(videoMime({ name: "x.mp4", type: "video/mp4" }), "video/mp4");
+  assert.equal(videoExtension("video/quicktime", "IMG_0001.MOV"), "mov");
+  assert.equal(videoExtension("video/webm;codecs=vp9", ""), "webm");
+  assert.equal(videoExtension("video/unknown", "noext"), "mp4");
+  assert.equal(formatDuration(75.4), "1:15");
+  assert.equal(formatDuration(3725), "1:02:05");
+  assert.equal(formatDuration(null), "");
+});
+
+test("video attachments round-trip through the Drive document", () => {
+  const entry = createEntry({ date: "2026-10-12" });
+  entry.photos.push(createPhoto({ width: 1920, height: 1080, kind: "video", name: "a.mov", mime: "video/quicktime", duration: 12.5, size: 3000 }));
+  entry.photos.push(createPhoto({ width: 10, height: 10, kind: "photo" }));
+  const back = parseEntry(JSON.stringify(serializeEntry(entry)));
+  assert.deepEqual(
+    { kind: back.photos[0].kind, mime: back.photos[0].mime, duration: back.photos[0].duration, size: back.photos[0].size },
+    { kind: "video", mime: "video/quicktime", duration: 12.5, size: 3000 });
+  assert.equal("mime" in back.photos[1], false, "photos carry no video fields");
+  const bogus = parseEntry({ ...serializeEntry(entry), photos: [{ id: "v", kind: "video", mime: "text/html", duration: -1 }] });
+  assert.deepEqual([bogus.photos[0].mime, bogus.photos[0].duration], ["video/mp4", null], "untrusted fields are sanitised");
 });

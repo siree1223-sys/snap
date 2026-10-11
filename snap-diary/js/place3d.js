@@ -364,6 +364,7 @@ export function createPlaceViewer(canvas, options) {
     snap() {
       state.target = state.target === 1 ? 0 : 1;
       state.animating = true;
+      state.lastInteraction = performance.now(); // hold the idle sway while dust flies
       requestFrame();
       return state.target === 1;
     },

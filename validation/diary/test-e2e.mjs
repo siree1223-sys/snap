@@ -27,6 +27,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const SITE = path.resolve(here, "../../dist/snap-diary");
 if (!fs.existsSync(path.join(SITE, "index.html"))) throw new Error("run python3 scripts/build-diary.py first");
 const CLIENT_ID = "1234567890-testclient.apps.googleusercontent.com";
+const HEIC = fs.readFileSync(path.join(here, "fixtures", "place.heic"));
 const TYPES = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".png": "image/png",
   ".webmanifest": "application/manifest+json", ".txt": "text/plain" };
 
@@ -47,9 +48,15 @@ const ORIGIN = `http://127.0.0.1:${server.address().port}`;
 const drive = createFakeDrive({ token: "test-token", email: "me@example.com" });
 const CORS = {
   "access-control-allow-origin": "*",
-  "access-control-allow-headers": "authorization, content-type",
-  "access-control-allow-methods": "GET, POST, PATCH, DELETE, OPTIONS"
+  "access-control-allow-headers": "authorization, content-type, content-range, x-upload-content-type, x-upload-content-length",
+  "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS"
 };
+// Like the real endpoint (probed): X-GUploader-UploadID is readable from JS.
+// Location is deliberately NOT exposed here, so the upload-id fallback is what
+// these tests exercise.
+const DRIVE_EXPOSE = { "access-control-expose-headers": "X-GUploader-UploadID, Range" };
+let heicPath = null;
+try { heicPath = require.resolve("heic-to"); } catch { /* optional: HEIC step reports it */ }
 const FAKE_GIS = `window.google = { accounts: { oauth2: {
   initTokenClient(cfg) {
     return { requestAccessToken(opts) {
@@ -84,7 +91,7 @@ async function newDevice(browser, { ai = true, config = null } = {}) {
     viewport: { width: 390, height: 844 }, deviceScaleFactor: 1, hasTouch: true, locale: "ko-KR",
     permissions: ["clipboard-read", "clipboard-write"]
   });
-  const stats = { cdn: 0, hf: 0 };
+  const stats = { cdn: 0, hf: 0, heic: 0 };
   await context.route("https://accounts.google.com/gsi/client", (route) =>
     route.fulfill({ status: 200, contentType: "text/javascript", body: FAKE_GIS }));
   await context.route("https://oauth2.googleapis.com/**", (route) => route.fulfill({ status: 200, headers: CORS, body: "{}" }));
@@ -96,10 +103,16 @@ async function newDevice(browser, { ai = true, config = null } = {}) {
       method: req.method(), url: req.url(), headers: await req.allHeaders(),
       body: buffer ? new Uint8Array(buffer) : null
     });
-    return route.fulfill({ status: result.status, headers: { ...CORS, ...result.headers },
+    if (result.networkError) return route.abort("connectionreset");
+    return route.fulfill({ status: result.status, headers: { ...CORS, ...DRIVE_EXPOSE, ...result.headers },
       body: result.body == null ? "" : Buffer.from(result.body) });
   });
   await context.route("https://cdn.jsdelivr.net/**", (route) => {
+    if (route.request().url().includes("/npm/heic-to@")) {
+      stats.heic++;
+      if (!heicPath) return route.fulfill({ status: 404, headers: CORS, body: "" });
+      return route.fulfill({ status: 200, headers: { ...CORS, "content-type": "text/javascript" }, body: fs.readFileSync(heicPath) });
+    }
     stats.cdn++;
     if (!ai) return route.fulfill({ status: 404, headers: CORS, body: "blocked in test" });
     return route.fulfill({ status: 200, headers: { ...CORS, "content-type": "text/javascript" }, body: FAKE_TRANSFORMERS });
@@ -155,10 +168,17 @@ async function litFraction(page) {
   })));
 }
 
+const viewerAt = (page, test) => page.waitForFunction(
+  (src) => { const v = globalThis.__snapDiary?.viewer; return Boolean(v) && new Function("p", `return ${src}`)(v.progress); },
+  test, { timeout: 30000 });
+/** Straight-on camera with the idle sway held, so frames are comparable. */
+const steady = (page) => page.evaluate(() => globalThis.__snapDiary.viewer.resetView());
+
 async function openViewer(page) {
   await page.locator(".place-card").first().click();
   await page.waitForSelector(".viewer-tools:not([hidden])", { timeout: 30000 });
-  await page.waitForTimeout(2700); // opening re-formation (2.2 s) has finished
+  await viewerAt(page, "p === 0"); // the opening re-formation has finished
+  await steady(page);
 }
 
 const steps = [];
@@ -209,15 +229,16 @@ try {
     assert.match(await A.page.locator(".viewer-top .chip").innerText(), /AI 깊이/);
     await A.page.screenshot({ path: path.join(here, "..", "..", "dist", "e2e-viewer.png") });
     await A.page.locator(".tool.primary").click();
-    await A.page.waitForTimeout(900);
+    await viewerAt(A.page, "p > 0.35 && p < 0.65");
     const midway = await litFraction(A.page);
-    await A.page.waitForTimeout(1900);
+    await viewerAt(A.page, "p === 1");
     const vanished = await litFraction(A.page);
     assert.ok(vanished < 0.01, `everything dissolved (lit ${vanished})`);
     assert.ok(midway > vanished && midway < intact, `dust in flight midway (lit ${midway})`);
     assert.match(await A.page.locator(".tool.primary").innerText(), /다시 모으기/);
     await A.page.locator(".tool.primary").click();
-    await A.page.waitForTimeout(2700);
+    await viewerAt(A.page, "p === 0");
+    await steady(A.page);
     const reformed = await litFraction(A.page);
     assert.ok(Math.abs(reformed - intact) < 0.02, `re-formed (lit ${reformed} vs ${intact})`);
     // Drag to orbit: the near red block should shift against the far sky.
@@ -399,6 +420,120 @@ try {
     await E.page.waitForSelector(".card");
     assert.match(await E.page.locator(".card").first().innerText(), /오프라인 기록/);
     await E.context.close();
+  });
+
+  let F;
+  await step("HEIC photos open without native HEIC support (libheif) and are stored as JPEG", async () => {
+    assert.ok(heicPath, "heic-to must be installed for this step (npm install --no-save heic-to@1.5.2)");
+    F = await newDevice(browser, { config: { googleClientId: CLIENT_ID, allowedEmails: [], driveFolderName: "Snap Diary" } });
+    const nativeHeic = await F.page.evaluate(async (b64) => {
+      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      try { await createImageBitmap(new Blob([bytes], { type: "image/heic" })); return true; } catch { return false; }
+    }, HEIC.toString("base64"));
+    assert.equal(nativeHeic, false, "this Chromium cannot decode HEIC itself, so the fallback is what runs");
+    await F.page.goto(`${ORIGIN}/#/new`);
+    await F.page.locator(".title-input").fill("HEIC와 동영상");
+    const inputs = F.page.locator(".photo-actions input[type=file]");
+    // Android pickers often send HEIC without a MIME type.
+    await inputs.nth(0).setInputFiles({ name: "IMG_2001.HEIC", mimeType: "", buffer: HEIC });
+    await inputs.nth(1).setInputFiles({ name: "IMG_2002.heic", mimeType: "image/heic", buffer: HEIC });
+    await F.page.waitForFunction(() => document.querySelectorAll(".photo-tile:not(.pending) img.ph[src]").length === 2, null, { timeout: 30000 });
+    await F.page.waitForFunction(() => /3D 준비됨 · AI 깊이/.test(document.body.innerText), null, { timeout: 30000 });
+    const stored = await F.page.evaluate(async () => {
+      const { db } = globalThis.__snapDiary;
+      const out = [];
+      for (const key of (await db.blobs.keys()).filter((k) => k.startsWith("photo:"))) {
+        const blob = await db.blobs.get(key);
+        const head = [...new Uint8Array(await blob.slice(0, 3).arrayBuffer())];
+        const bmp = await createImageBitmap(blob);
+        out.push({ type: blob.type, head, w: bmp.width, h: bmp.height });
+      }
+      return out;
+    });
+    assert.equal(stored.length, 2);
+    for (const s of stored) {
+      assert.equal(s.type, "image/jpeg");
+      assert.deepEqual(s.head, [0xff, 0xd8, 0xff]);
+      assert.deepEqual([s.w, s.h], [320, 240], "decoded at the HEIC's real size");
+    }
+    assert.ok(F.stats.heic >= 1, "converter fetched from the CDN on demand");
+  });
+
+  await step("a video gets a poster, uploads resumably to Drive and plays on another phone", async () => {
+    const webm = Buffer.from(await F.page.evaluate(async () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = 320; canvas.height = 240;
+      const g = canvas.getContext("2d");
+      const rec = new MediaRecorder(canvas.captureStream(30), { mimeType: "video/webm" });
+      const chunks = [];
+      rec.ondataavailable = (e) => chunks.push(e.data);
+      const stopped = new Promise((r) => { rec.onstop = r; });
+      rec.start(100);
+      const t0 = performance.now();
+      await new Promise((resolve) => {
+        const draw = () => {
+          const t = performance.now() - t0;
+          g.fillStyle = "#1e64c8"; g.fillRect(0, 0, 320, 240);
+          g.fillStyle = "#ffd60a"; g.fillRect((t / 8) % 280, 90, 40, 60);
+          if (t < 1500) requestAnimationFrame(draw); else resolve();
+        };
+        draw();
+      });
+      rec.stop();
+      await stopped;
+      const bytes = new Uint8Array(await new Blob(chunks).arrayBuffer());
+      let s = "";
+      for (let i = 0; i < bytes.length; i += 8192) s += String.fromCharCode(...bytes.subarray(i, i + 8192));
+      return btoa(s);
+    }), "base64");
+    assert.ok(webm.length > 1000, `recorded a real clip (${webm.length} bytes)`);
+    await F.page.locator(".photo-actions input[type=file]").nth(0).setInputFiles({ name: "clip.webm", mimeType: "video/webm", buffer: webm });
+    await F.page.waitForFunction(() => document.querySelectorAll(".photo-tile:not(.pending)").length === 3, null, { timeout: 30000 });
+    const tile = F.page.locator(".photo-tile").nth(2);
+    assert.equal(await tile.locator(".play-badge").count(), 1);
+    assert.equal(await tile.locator(".kind-btn").count(), 0, "videos cannot be turned into 3D places");
+    const poster = await tile.locator("img.ph").evaluate((img) => new Promise((resolve) => {
+      const check = () => {
+        if (!img.complete || !img.naturalWidth) return setTimeout(check, 50);
+        const c = document.createElement("canvas");
+        c.width = img.naturalWidth; c.height = img.naturalHeight;
+        const g = c.getContext("2d");
+        g.drawImage(img, 0, 0);
+        resolve({ w: c.width, h: c.height, px: [...g.getImageData(4, 4, 1, 1).data].slice(0, 3) });
+      };
+      check();
+    }));
+    assert.deepEqual([poster.w, poster.h], [320, 240], "poster captured from the video itself");
+    assert.ok(poster.px[2] > 150 && poster.px[0] < 80, `poster shows the clip's blue frame (${poster.px})`);
+    await F.page.locator(".editor .screen-head .btn.primary").click();
+    await F.page.waitForSelector(".screen.entry");
+    await chip(F.page).click();
+    await until(() => drive.live("video").length === 1 && drive.live("entry").some((f) => drive.text(f.id).includes("HEIC와 동영상")), 30000);
+    const [video] = drive.live("video");
+    assert.deepEqual(Buffer.from(video.content), webm, "the original video, byte for byte");
+    assert.equal(video.mimeType, "video/webm");
+    assert.equal(drive.files.get(video.parents[0]).appProperties.snapDiary, "videos");
+    assert.ok(drive.log.some((l) => l.startsWith("PUT /upload/drive/v3/files") && /upload_id=/.test(l) && /fields=/.test(l)),
+      "session URI rebuilt from X-GUploader-UploadID (Location hidden)");
+    const doc = JSON.parse(drive.text(drive.live("entry").find((f) => drive.text(f.id).includes("HEIC와 동영상")).id));
+    assert.deepEqual(doc.photos.map((p) => p.kind), ["photo", "place", "video"]);
+
+    const G = await newDevice(browser, { config: { googleClientId: CLIENT_ID, allowedEmails: [], driveFolderName: "Snap Diary" } });
+    await chip(G.page).click();
+    await waitChip(G.page, /동기화됨/);
+    await G.page.locator(".card", { hasText: "HEIC와 동영상" }).click();
+    await G.page.waitForSelector(".screen.entry");
+    await G.page.locator(".photo-cell").last().click();
+    await G.page.waitForFunction(() => {
+      const v = document.querySelector(".lightbox.player video");
+      return v && v.readyState >= 1 && !v.classList.contains("hidden");
+    }, null, { timeout: 30000 });
+    await G.page.locator(".lightbox.player .close").click();
+    assert.equal(await G.page.locator(".lightbox").count(), 0);
+    assert.deepEqual(G.errors, []);
+    await G.context.close();
+    assert.deepEqual(F.errors, []);
+    await F.context.close();
   });
 
   for (const device of [A, B]) assert.deepEqual(device.errors, [], "no page errors");
