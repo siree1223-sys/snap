@@ -1,0 +1,6 @@
+{
+  "name": "snap-diary",
+  "private": true,
+  "type": "module",
+  "description": "Private PWA diary with Google Drive sync and 3D place photos (grain renderer from Meet Vanish)"
+}

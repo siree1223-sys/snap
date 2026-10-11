@@ -1,0 +1,81 @@
+name: Snap Diary
+
+on:
+  push:
+    paths:
+      - "snap-diary/**"
+      - "validation/diary/**"
+      - "scripts/build-diary.py"
+      - "meet-vanish-extension/dust-effect.js"
+      - ".github/workflows/snap-diary.yml"
+  pull_request:
+    paths:
+      - "snap-diary/**"
+      - "validation/diary/**"
+      - "scripts/build-diary.py"
+      - "meet-vanish-extension/dust-effect.js"
+      - ".github/workflows/snap-diary.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: snap-diary-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit and sync tests
+        run: npm run test:diary
+      - name: Build site
+        run: npm run build:diary
+      - name: Install Playwright Chromium
+        run: |
+          npm install --no-save --no-package-lock playwright@1.56.1
+          npx playwright install --with-deps chromium
+      - name: End-to-end browser test
+        run: node validation/diary/test-e2e.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: snap-diary-site
+          path: |
+            dist/snap-diary
+            dist/e2e-*.png
+          if-no-files-found: warn
+
+  # Publishes the app to GitHub Pages from the default branch. One-time setup:
+  # repository Settings -> Pages -> Build and deployment -> Source: GitHub Actions.
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 scripts/build-diary.py
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist/snap-diary
+      - id: deployment
+        uses: actions/deploy-pages@v4

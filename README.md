@@ -4,6 +4,8 @@ An offline Chrome extension for Google Meet: capture your empty room, then vanis
 
 this is an updated version of it. No compilation, API keys, or hosted backend are required.
 
+> **Also in this repository: [Snap Diary](snap-diary/README.md)** — a private, installable diary PWA (Korean UI) that syncs to your own Google Drive and turns place photos into 3D grain clouds using this extension's dust renderer.
+
 ## Features
 
 - Captured empty-room image replaces your outgoing camera video.

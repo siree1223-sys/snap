@@ -1,0 +1,19 @@
+{
+  "id": "./",
+  "name": "스냅 다이어리",
+  "short_name": "스냅 다이어리",
+  "description": "오늘 한 일을 사진과 함께 남기고, 다녀온 장소를 3D로 다시 보는 나만의 다이어리",
+  "lang": "ko",
+  "start_url": "./#/",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f5f1ea",
+  "theme_color": "#15131b",
+  "categories": ["lifestyle", "photo"],
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
