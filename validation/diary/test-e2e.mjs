@@ -646,6 +646,81 @@ try {
     await I.context.close();
   });
 
+  await step("places are arranged by country and city; hand-typed and older entries can be placed", async () => {
+    const J = await newDevice(browser);
+    const searches = [];
+    await J.context.route("https://nominatim.openstreetmap.org/**", (route) => {
+      const url = new URL(route.request().url());
+      const json = (body) => route.fulfill({ status: 200, headers: { ...CORS, "content-type": "application/json" }, body: JSON.stringify(body) });
+      if (url.pathname === "/search") {
+        searches.push(url.searchParams.get("q"));
+        return json([
+          { lat: "34.9218", lon: "127.7537", name: "배알도수변공원", display_name: "배알도수변공원, 태인동, 광양시, 전라남도, 대한민국",
+            address: { leisure: "배알도수변공원", suburb: "태인동", city: "광양시", province: "전라남도", country: "대한민국", country_code: "kr" } },
+          { lat: "35.0116", lon: "135.7681", name: "교토", display_name: "교토시, 교토부, 일본",
+            address: { city: "교토시", province: "교토부", country: "일본", country_code: "jp" } }]);
+      }
+      const lat = Number(url.searchParams.get("lat"));
+      return json({ address: lat < 35
+        ? { suburb: "해룡면", city: "순천시", province: "전라남도", country: "대한민국", country_code: "kr" }
+        : { suburb: "성수동2가", borough: "성동구", city: "서울", country: "대한민국", country_code: "kr" } });
+    });
+    // 1) Typed by hand, no position (like entries written before this version).
+    await J.page.goto(`${ORIGIN}/#/new/2026-10-10`);
+    await J.page.locator(".title-input").fill("광양 배알도수변공원");
+    await J.page.locator(".editor .screen-head .btn.primary").click();
+    await J.page.waitForSelector(".screen.entry");
+    // 2) An older entry with a position but no country/city yet.
+    await J.page.evaluate(async () => {
+      const { db } = globalThis.__snapDiary;
+      await db.entries.put({ id: "olderentry1", date: "2026-10-09", title: "순천만 습지", text: "", mood: "",
+        place: { name: "순천", lat: 34.8826, lng: 127.5097 }, photos: [], createdAt: "2026-10-09T10:00:00.000Z",
+        updatedAt: "2026-10-09T10:00:00.000Z", sync: { dirty: true, rev: 1, driveId: null, remoteModified: null, trash: [] } });
+    });
+    await J.page.goto(`${ORIGIN}/#/places`);
+    await J.page.waitForFunction(() => /순천/.test(document.querySelector(".country:not(.unplaced)")?.innerText || ""), null, { timeout: 15000 });
+    assert.match(await J.page.locator(".country:not(.unplaced)").first().innerText(), /대한민국[\s\S]*순천/, "older entry filled in and placed");
+    const older = await J.page.evaluate(() => globalThis.__snapDiary.db.entries.get("olderentry1"));
+    assert.deepEqual([older.place.country, older.place.city, older.place.name], ["대한민국", "순천", "순천"], "typed name kept");
+    assert.ok(older.sync.dirty && older.sync.rev > 1, "change queued for Drive");
+    // The hand-typed entry waits under "no country/city" and is placed with a search.
+    const unplaced = J.page.locator(".unplaced");
+    assert.match(await unplaced.innerText(), /광양 배알도수변공원/);
+    await unplaced.getByRole("button", { name: /위치 찾기/ }).click();
+    await J.page.waitForSelector(".search-result");
+    assert.deepEqual(searches, ["광양 배알도수변공원"], "searched with the entry's own words, on request only");
+    const firstResult = J.page.locator(".search-result").first();
+    assert.match(await firstResult.innerText(), /배알도수변공원[\s\S]*대한민국 › 광양/);
+    await firstResult.click();
+    await J.page.waitForFunction(() => !document.querySelector(".unplaced"));
+    const cities = await J.page.locator(".country:not(.unplaced)").first().locator(".city-row strong").allInnerTexts();
+    assert.deepEqual(cities.sort(), ["광양", "순천"]);
+    // City page lists that city's entries; entries link back to their city.
+    await J.page.locator(".city-row", { hasText: "광양" }).click();
+    await J.page.waitForSelector(".screen .timeline .card");
+    assert.match(await J.page.locator(".screen-head h1").innerText(), /광양/);
+    await J.page.locator(".card").first().click();
+    await J.page.waitForSelector(".screen.entry");
+    assert.match(await J.page.locator(".region-link").innerText(), /대한민국 › 광양/);
+    // 3) In the editor: "위치 찾기" sets a place abroad.
+    await J.page.goto(`${ORIGIN}/#/new/2026-09-20`);
+    await J.page.locator(".text-input").fill("교토 여행 첫날");
+    await J.page.locator(".place-field input").fill("교토");
+    await J.page.getByRole("button", { name: "위치 찾기" }).click();
+    await J.page.locator(".search-result", { hasText: "교토시, 교토부" }).click();
+    assert.match(await J.page.locator(".region-chip").innerText(), /일본 › 교토(?!시)/, "교토시 is shown as 교토, like 순천시 -> 순천");
+    await J.page.locator(".editor .screen-head .btn.primary").click();
+    await J.page.waitForSelector(".screen.entry");
+    await J.page.goto(`${ORIGIN}/#/places`);
+    await J.page.waitForSelector(".country:not(.unplaced)");
+    const countries = await J.page.locator(".country:not(.unplaced) .country-head").allInnerTexts();
+    assert.match(countries[0], /🇰🇷\s*대한민국/);
+    assert.match(countries[1], /🇯🇵\s*일본/);
+    assert.match(await J.page.locator(".lead").innerText(), /2개 나라 · 3개 도시/);
+    assert.deepEqual(J.errors, []);
+    await J.context.close();
+  });
+
   for (const device of [A, B]) assert.deepEqual(device.errors, [], "no page errors");
   console.log(`\n# e2e pass ${steps.length}`);
 } catch (error) {
