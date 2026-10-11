@@ -383,3 +383,12 @@ img.ph:not([src]) { visibility: hidden; }
 .org-thumb.more { font-size: .8rem; font-weight: 600; }
 .org-actions { position: sticky; bottom: calc(12px + var(--safe-b)); display: grid; margin-top: 8px; }
 .org-actions .btn { padding: 14px; box-shadow: var(--shadow); }
+
+/* ---------- update ---------- */
+.update-banner {
+  position: fixed; left: 12px; right: 12px; top: calc(10px + var(--safe-t)); z-index: 95;
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px 10px 16px; border-radius: 16px;
+  background: var(--text); color: var(--bg); box-shadow: var(--shadow); max-width: 520px; margin: 0 auto;
+}
+.update-banner span { flex: 1; }
+.btn-row.center { justify-content: center; }

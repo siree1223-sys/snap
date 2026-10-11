@@ -12,7 +12,7 @@ function readLocal(key) {
 
 export const CONFIG = {
   ...SITE_CONFIG,
-  appVersion: "1.2.0",
+  appVersion: "1.2.1",
   scope: "https://www.googleapis.com/auth/drive.file",
   // Pinned, not "latest": a model/runtime update must be a deliberate change.
   transformersUrl: "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.0/dist/transformers.min.js",
