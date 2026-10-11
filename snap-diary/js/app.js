@@ -6,14 +6,14 @@ import { createSync } from "./sync.js";
 import { commitEdit, deleteEntry, attachDepth, visibleEntries } from "./repo.js";
 import {
   createEntry, createPhoto, groupByMonth, formatKoreanDate, excerpt, matchesQuery, MOODS,
-  monthGrid, toISODate, isEntryEmpty, sortEntries, formatMonth, isISODate, isVideo, applyCaptureInfo
+  monthGrid, toISODate, isEntryEmpty, sortEntries, formatMonth, isISODate, isVideo, applyCaptureInfo, applyRegion, touch
 } from "./model.js";
 import { preparePhoto, decodeImage, photoSize, setPhotoSize } from "./images.js";
 import { prepareVideo } from "./video.js";
 import { isVideoFile, formatDuration } from "./media.js";
 import { readCaptureInfo } from "./exif.js";
-import { regionName, geocodeEnabled, setGeocodeEnabled, ATTRIBUTION } from "./geocode.js";
-import { planDays, distinctNames, googlePhotosDayUrl } from "./organize.js";
+import { lookupRegion, searchPlaces, flag, geocodeEnabled, setGeocodeEnabled, ATTRIBUTION } from "./geocode.js";
+import { planDays, distinctNames, googlePhotosDayUrl, groupPlaces, placeKey, needsRegion } from "./organize.js";
 import { estimateDepth, depthToBlob, blobToDepth } from "./depth.js";
 import { createPlaceViewer } from "./place3d.js";
 import { h, icon, clear, toast, confirmSheet, urlScope, formatTime, formatBytes } from "./ui.js";
@@ -112,7 +112,54 @@ async function importMedia(file, kind) {
   return { photo, info, notice };
 }
 
-const placeLookup = (lat, lng) => regionName(lat, lng, db.meta);
+const regionLookup = (lat, lng) => lookupRegion(lat, lng, db.meta);
+
+/** "🇰🇷 대한민국 › 순천" */
+function regionText(place) {
+  if (!place?.city && !place?.country) return "";
+  return `${flag(place.countryCode)} ${[place.country, place.city].filter(Boolean).join(" › ")}`;
+}
+
+/** Bottom sheet to find a place by name; resolves { name, lat, lng, region } or null. */
+function placeSearchSheet(initial = "") {
+  return new Promise((resolve) => {
+    const input = h("input", { class: "search-input", value: initial, placeholder: "예: 순천만 습지, 광양 배알도, 교토", maxlength: 80 });
+    const results = h("div", { class: "search-results", "aria-live": "polite" });
+    const close = (value) => {
+      sheet.classList.remove("open");
+      setTimeout(() => backdrop.remove(), 200);
+      resolve(value);
+    };
+    const run = async () => {
+      const q = input.value.trim();
+      if (!q) return;
+      clear(results).append(h("p", { class: "muted small", text: "찾는 중…" }));
+      const found = await searchPlaces(q);
+      clear(results);
+      if (!found.length) {
+        results.append(h("p", { class: "muted small", text: geocodeEnabled() ? "찾지 못했어요. 다르게 적어 보세요." : "설정에서 ‘지역 이름 찾기’를 켜야 검색할 수 있어요." }));
+        return;
+      }
+      for (const place of found) {
+        results.append(h("button", { type: "button", class: "search-result", onclick: () => close(place) },
+          h("strong", { text: place.name }),
+          h("span", { class: "small", text: regionText(place.region) }),
+          h("span", { class: "muted small", text: place.detail })));
+      }
+    };
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); run(); } });
+    const sheet = h("div", { class: "sheet", role: "dialog", "aria-modal": "true", "aria-label": "위치 찾기" },
+      h("h3", { text: "위치 찾기" }),
+      h("div", { class: "search-row" }, input, h("button", { type: "button", class: "btn primary small", text: "찾기", onclick: run })),
+      results,
+      h("p", { class: "muted small", text: ATTRIBUTION }),
+      h("div", { class: "sheet-actions single" }, h("button", { class: "btn ghost", text: "닫기", onclick: () => close(null) })));
+    const backdrop = h("div", { class: "backdrop", onclick: (e) => { if (e.target === backdrop) close(null); } }, sheet);
+    document.body.append(backdrop);
+    requestAnimationFrame(() => { sheet.classList.add("open"); input.focus(); });
+    if (initial) run();
+  });
+}
 
 // ---------- depth jobs (one at a time; the AI model is memory hungry) ----------
 
@@ -265,7 +312,8 @@ const ROUTES = [
   [/^#\/edit\/([a-z0-9]+)$/, (m) => screenEditor({ id: m[1] }), null],
   [/^#\/new(?:\/(\d{4}-\d{2}-\d{2}))?$/, (m) => screenEditor({ date: m[1] }), null],
   [/^#\/view\/([a-z0-9]+)\/([a-z0-9]+)$/, (m) => screenViewer(m[1], m[2]), null],
-  [/^#\/organize$/, () => screenOrganize(), null]
+  [/^#\/organize$/, () => screenOrganize(), null],
+  [/^#\/places\/city\/(.+)$/, (m) => screenCity(decodeURIComponent(m[1])), "places"]
 ];
 
 let ctx = null;
@@ -419,6 +467,8 @@ async function screenEntry(id) {
       ? h(mapLink ? "a" : "span", { class: "chip place-chip", href: mapLink, target: mapLink ? "_blank" : null, rel: "noopener" },
         icon("place", 16), entry.place?.name || `${entry.place.lat.toFixed(4)}, ${entry.place.lng.toFixed(4)}`)
       : null,
+    entry.place?.city ? h("a", { class: "chip region-link", href: `#/places/city/${encodeURIComponent(placeKey(entry.place))}` },
+      regionText(entry.place)) : null,
     visited.length ? h("div", { class: "chip-row" }, h("span", { class: "muted small", text: "이날 다녀온 곳" }),
       visited.map((name) => h("span", { class: "chip" }, icon("place", 14), name))) : null,
     places.map((p) => h("a", { class: "place-card", href: `#/view/${id}/${p.id}` },
@@ -527,18 +577,29 @@ async function screenEditor({ id, date }) {
   function useCaptureInfo(photo, info) {
     if (isNew && !dateTouched && info.source !== "file" && info.date && info.date !== draft.date) showDateHint(info.date);
     if (!Number.isFinite(photo.lat)) return;
-    placeLookup(photo.lat, photo.lng).then((label) => { if (label) photo.placeName = label; });
+    regionLookup(photo.lat, photo.lng).then((region) => {
+      if (!region) return;
+      photo.placeName = region.label;
+      applyRegion(photo, region);
+    });
     const hasPlace = draft.place?.name?.trim() || Number.isFinite(draft.place?.lat);
     if (hasPlace) return;
     draft.place = { name: "", lat: photo.lat, lng: photo.lng };
     markDirty();
     paintCoords();
-    placeLookup(photo.lat, photo.lng).then((label) => {
-      if (label && !placeInput.value.trim() && draft.place && !draft.place.name) {
-        draft.place.name = label;
-        placeInput.value = label;
-      }
-    });
+    placeFromPosition(photo.lat, photo.lng);
+  }
+  /** Country/city (and an empty place name) from a position; typed names are kept. */
+  async function placeFromPosition(lat, lng) {
+    const region = await regionLookup(lat, lng);
+    if (!region || !draft.place || draft.place.lat !== lat || draft.place.lng !== lng) return;
+    applyRegion(draft.place, region);
+    if (!placeInput.value.trim() && !draft.place.name) {
+      draft.place.name = region.label;
+      placeInput.value = region.label;
+    }
+    markDirty();
+    paintCoords();
   }
   const moods = h("div", { class: "moods", role: "group", "aria-label": "기분" }, MOODS.map((m) =>
     h("button", { type: "button", class: `mood-btn ${draft.mood === m ? "on" : ""}`, text: m, "aria-pressed": String(draft.mood === m),
@@ -552,9 +613,17 @@ async function screenEditor({ id, date }) {
         e.currentTarget.blur();
       } })));
   const coords = h("span", { class: "muted small" });
+  const regionChip = h("span", { class: "region-chip" });
   const paintCoords = () => {
     coords.textContent = draft.place && Number.isFinite(draft.place.lat)
       ? `${draft.place.lat.toFixed(4)}, ${draft.place.lng.toFixed(4)}` : "";
+    clear(regionChip);
+    const text = regionText(draft.place);
+    regionChip.hidden = !text;
+    if (text) {
+      regionChip.append(h("span", { text }), h("button", { type: "button", class: "icon-btn tiny", "aria-label": "국가·도시 지우기",
+        onclick: () => { applyRegion(draft.place, {}); markDirty(); paintCoords(); } }, icon("close", 14)));
+    }
   };
   const placeInput = h("input", { placeholder: "장소 이름 (예: 성수동 카페)", value: draft.place?.name || "", maxlength: 60,
     oninput: (e) => { draft.place = { lat: null, lng: null, ...(draft.place || {}), name: e.target.value }; markDirty(); } });
@@ -566,11 +635,21 @@ async function screenEditor({ id, date }) {
       draft.place = { name: draft.place?.name || "", lat: +pos.coords.latitude.toFixed(6), lng: +pos.coords.longitude.toFixed(6) };
       markDirty();
       paintCoords();
+      placeFromPosition(draft.place.lat, draft.place.lng);
     }, () => {
       locate.disabled = false;
       toast("위치 권한이 필요해요.", { error: true });
     }, { enableHighAccuracy: true, timeout: 12000, maximumAge: 60000 });
   } }, icon("locate", 16), "현재 위치");
+  const findPlace = h("button", { type: "button", class: "btn ghost small", onclick: async () => {
+    const picked = await placeSearchSheet(placeInput.value.trim() || titleInput.value.trim());
+    if (!picked) return;
+    const name = placeInput.value.trim() || picked.name;
+    draft.place = applyRegion({ name, lat: picked.lat, lng: picked.lng }, picked.region);
+    placeInput.value = name;
+    markDirty();
+    paintCoords();
+  } }, icon("search", 16), "위치 찾기");
   paintCoords();
 
   const tiles = h("div", { class: "photo-tiles" });
@@ -703,8 +782,8 @@ async function screenEditor({ id, date }) {
     dateHint,
     titleInput,
     textArea,
-    h("div", { class: "field place-field" }, icon("place", 18), placeInput, locate),
-    coords,
+    h("div", { class: "field place-field" }, icon("place", 18), placeInput),
+    h("div", { class: "place-tools" }, locate, findPlace, regionChip, coords),
     h("div", { class: "photo-actions" },
       h("button", { type: "button", class: "btn ghost", onclick: () => photoInput.click() }, icon("photo", 18), "사진·동영상"),
       h("button", { type: "button", class: "btn accent", onclick: () => placeInput3d.click() }, icon("cube", 18), "장소 사진 (3D)"),
@@ -760,22 +839,120 @@ async function screenCalendar(month) {
     dayLists);
 }
 
+const regionTried = new Set();
+
+/** Older entries with positions but no country/city get them filled in (once per session). */
+async function backfillRegions(entries, status) {
+  let changed = 0;
+  // Claimed up front so reopening the tab mid-way does not start a second pass.
+  for (const entry of entries) regionTried.add(entry.id);
+  for (const [i, entry] of entries.entries()) {
+    status.textContent = `도시 정보 채우는 중 ${i + 1}/${entries.length}`;
+    const spots = [entry.place, ...entry.photos].filter((p) => p && Number.isFinite(p.lat) && !p.city);
+    const found = new Map();
+    for (const spot of spots) {
+      const region = await regionLookup(spot.lat, spot.lng);
+      if (region) found.set(`${spot.lat},${spot.lng}`, region);
+    }
+    if (!found.size) continue;
+    await db.entries.update(entry.id, (cur) => {
+      if (!cur || cur.sync?.deleted) return undefined;
+      for (const spot of [cur.place, ...cur.photos]) {
+        const region = spot && !spot.city && found.get(`${spot.lat},${spot.lng}`);
+        if (!region) continue;
+        applyRegion(spot, region);
+        if (spot !== cur.place && !spot.placeName) spot.placeName = region.label;
+      }
+      return touch(cur);
+    });
+    changed++;
+  }
+  status.textContent = "";
+  return changed;
+}
+
+function cityRow(city, scope) {
+  const latest = city.entries[0];
+  const cover = city.entries.flatMap((e) => e.photos)[0];
+  return h("a", { class: "city-row", href: `#/places/city/${encodeURIComponent(city.key)}` },
+    cover ? photoImg(cover, scope, { cls: "city-thumb" }) : h("div", { class: "city-thumb empty-thumb" }, icon("place", 20)),
+    h("div", { class: "city-text" },
+      h("strong", { text: city.city }),
+      h("span", { class: "muted small", text: [city.province && !city.province.startsWith(city.city) ? city.province : "",
+        `기록 ${city.entries.length}`, formatKoreanDate(latest.date, { withYear: false })].filter(Boolean).join(" · ") })),
+    icon("chevronR", 18));
+}
+
 async function screenPlaces() {
   const all = sortEntries(visibleEntries(await db.entries.all()));
+  const { countries, unplaced } = groupPlaces(all);
+  const scope = ctx.scope;
+  const myCtx = ctx;
+  const status = h("p", { class: "muted small", "aria-live": "polite" });
+  const pending = all.filter((e) => needsRegion(e) && !regionTried.has(e.id));
+  if (pending.length && geocodeEnabled() && navigator.onLine) {
+    backfillRegions(pending, status).then((changed) => {
+      if (changed) scheduleSync();
+      if (changed && ctx === myCtx) route({ keepScroll: true });
+    });
+  }
   const items = all.flatMap((e) => e.photos.filter((p) => p.kind === "place").map((p) => ({ entry: e, photo: p })));
-  return h("div", { class: "screen" },
+  const locate = async (entry) => {
+    const picked = await placeSearchSheet(entry.place?.name || entry.title || "");
+    if (!picked) return;
+    await db.entries.update(entry.id, (cur) => {
+      if (!cur) return undefined;
+      cur.place = applyRegion({ name: cur.place?.name || picked.name, lat: picked.lat, lng: picked.lng }, picked.region);
+      return touch(cur);
+    });
+    toast(`${regionText(picked.region)}에 정리했어요.`);
+    scheduleSync();
+    route({ keepScroll: true });
+  };
+  return h("div", { class: "screen places" },
     topBar("장소"),
-    h("p", { class: "muted lead", text: "다녀온 곳을 3D로 다시 걸어 보세요. 사진이 먼지처럼 모였다가 흩어집니다." }),
+    countries.length
+      ? h("p", { class: "muted lead", text: `${countries.length}개 나라 · ${countries.reduce((n, c) => n + c.cities.length, 0)}개 도시를 다녀왔어요.` })
+      : h("p", { class: "muted lead", text: "기록의 장소를 나라와 도시별로 모아 보여 줘요. 사진 위치나 ‘위치 찾기’로 장소를 정해 보세요." }),
+    status,
+    countries.map((country) => h("section", { class: "country" },
+      h("h2", { class: "country-head" },
+        h("span", { class: "flag", "aria-hidden": "true", text: flag(country.code) }),
+        h("span", { text: country.name }),
+        h("span", { class: "muted small", text: `도시 ${country.cities.length} · 기록 ${country.count}` })),
+      h("div", { class: "city-list" }, country.cities.map((city) => cityRow(city, scope))))),
+    unplaced.length ? h("section", { class: "country unplaced" },
+      h("h2", { class: "country-head" }, h("span", { class: "flag", "aria-hidden": "true", text: "📍" }),
+        h("span", { text: "나라·도시가 없는 기록" }), h("span", { class: "muted small", text: `${unplaced.length}` })),
+      h("div", { class: "city-list" }, unplaced.map((entry) => h("div", { class: "city-row" },
+        h("a", { class: "city-text", href: `#/entry/${entry.id}` },
+          h("strong", { text: entry.title || entry.place?.name || excerpt(entry.text, 24) || "기록" }),
+          h("span", { class: "muted small", text: [entry.place?.name, formatKoreanDate(entry.date, { withYear: false })].filter(Boolean).join(" · ") })),
+        h("button", { class: "btn ghost small", onclick: () => locate(entry) }, icon("search", 15), "위치 찾기"))))) : null,
+    h("h2", { class: "section-title" }, icon("cube", 18), "3D 장소 사진"),
     items.length ? h("div", { class: "place-grid" }, items.map(({ entry, photo }) =>
       h("a", { class: "place-tile", href: `#/view/${entry.id}/${photo.id}` },
-        photoImg(photo, ctx.scope),
+        photoImg(photo, scope),
         h("span", { class: "badge-3d small" }, icon("cube", 13), "3D"),
         h("span", { class: "place-name", text: entry.place?.name || entry.title || formatKoreanDate(entry.date, { withYear: false }) }),
         h("span", { class: "place-date", text: entry.date })))) :
-      h("div", { class: "empty" },
-        h("div", { class: "empty-art cube", "aria-hidden": "true" }),
-        h("p", { text: "아직 장소 사진이 없어요." }),
-        h("p", { class: "muted", text: "기록을 쓸 때 ‘장소 사진 (3D)’로 올려 보세요." })));
+      h("p", { class: "muted small", text: "기록을 쓸 때 ‘장소 사진 (3D)’로 올리면 여기서 3D로 다시 볼 수 있어요." }),
+    geocodeEnabled() ? h("p", { class: "muted small about", text: ATTRIBUTION }) : null);
+}
+
+async function screenCity(key) {
+  const { countries } = groupPlaces(sortEntries(visibleEntries(await db.entries.all())));
+  const country = countries.find((c) => c.cities.some((city) => city.key === key));
+  const city = country?.cities.find((c) => c.key === key);
+  const back = () => (history.length > 1 ? history.back() : go("#/places"));
+  if (!city) {
+    return h("div", { class: "screen" }, topBar("장소", { back }), h("p", { class: "empty muted", text: "이 도시의 기록이 없어요." }));
+  }
+  return h("div", { class: "screen" },
+    topBar(`${flag(country.code)} ${city.city}`, { back }),
+    h("p", { class: "muted lead", text: [country.name, city.province && !city.province.startsWith(city.city) ? city.province : "",
+      `기록 ${city.entries.length}`].filter(Boolean).join(" · ") }),
+    h("div", { class: "timeline" }, city.entries.map((e) => entryCard(e, ctx.scope))));
 }
 
 async function screenViewer(entryId, photoId) {
@@ -919,7 +1096,8 @@ async function screenOrganize() {
       const places = days.flatMap((d) => d.places);
       for (const [i, place] of places.entries()) {
         status.textContent = geocodeEnabled() ? `지역 이름 찾는 중 ${i + 1}/${places.length}` : "";
-        place.name = await placeLookup(place.lat, place.lng);
+        place.region = await regionLookup(place.lat, place.lng);
+        place.name = place.region?.label || "";
         if (!alive()) return;
       }
       const withGps = items.filter((it) => Number.isFinite(it.info.lat)).length;
@@ -961,6 +1139,7 @@ async function screenOrganize() {
           day.guessed ? h("span", { class: "chip", text: "날짜 추정" }) : null,
           h("span", { class: "muted small", text: `${day.items.length}개` })),
         h("div", { class: "org-place-row" }, icon("place", 16), name),
+        main?.region?.city ? h("p", { class: "small org-region", text: regionText(main.region) }) : null,
         others.length ? h("p", { class: "muted small", text: `그 밖에: ${others.join(", ")}` }) : null,
         day.entryId ? h("p", { class: "muted small", text: "이날 쓴 기록에 사진을 더해요." }) : null,
         h("div", { class: "org-thumbs" }, day.items.slice(0, 6).map(preview),
@@ -984,13 +1163,15 @@ async function screenOrganize() {
       for (const { day, name } of chosen) {
         const label = name.value.trim();
         const main = day.places[0];
-        const placeOf = new Map(day.places.flatMap((p) => p.items.map((id) => [id, p.name])));
+        const placeOf = new Map(day.places.flatMap((p) => p.items.map((id) => [id, p])));
         const photos = [];
         for (const item of day.items) {
           status.textContent = `사진 정리 중 ${++done}/${total}`;
           try {
             const { photo } = await importMedia(item.file, "photo");
-            if (placeOf.get(item.id)) photo.placeName = placeOf.get(item.id);
+            const spot = placeOf.get(item.id);
+            if (spot?.name) photo.placeName = spot.name;
+            if (spot?.region) applyRegion(photo, spot.region);
             photos.push(photo);
           } catch (error) {
             failed++;
@@ -998,12 +1179,17 @@ async function screenOrganize() {
           }
         }
         if (!photos.length) continue;
-        const place = label || main ? { name: label, lat: main?.lat ?? null, lng: main?.lng ?? null } : null;
+        const place = label || main
+          ? applyRegion({ name: label, lat: main?.lat ?? null, lng: main?.lng ?? null }, main?.region || {}) : null;
         const stored = day.entryId ? await db.entries.get(day.entryId) : null;
         if (stored && !stored.sync?.deleted) {
           const next = structuredClone(stored);
           next.photos.push(...photos);
           if (!next.place?.name && place) next.place = place;
+          else if (next.place && !next.place.city && main?.region?.city && !Number.isFinite(next.place.lat)) {
+            // A place typed by hand that day gets the photos' position, country and city.
+            next.place = applyRegion({ ...next.place, lat: main.lat, lng: main.lng }, main.region);
+          }
           await commitEdit(store, next);
         } else {
           const entry = createEntry({ date: day.date });

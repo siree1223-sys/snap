@@ -68,7 +68,7 @@ test("damaged or bogus metadata never throws and is ignored", async () => {
 });
 
 // ---------- region names and day plans ----------
-import { regionLabel, neighbourhood, regionName, cacheKey } from "../../snap-diary/js/geocode.js";
+import { regionLabel, regionInfo, neighbourhood, regionName, lookupRegion, searchPlaces, cacheKey, flag } from "../../snap-diary/js/geocode.js";
 import { planDays, distinctNames, googlePhotosDayUrl, distanceKm } from "../../snap-diary/js/organize.js";
 
 test("Korean region labels do not depend on which address keys Nominatim uses", () => {
@@ -86,7 +86,7 @@ test("Korean region labels do not depend on which address keys Nominatim uses", 
     [{ village: "가남읍", county: "여주시", state: "경기도", country_code: "kr" }, "경기 여주시 가남읍"],
     [{ town: "보은읍", county: "보은군", province: "충청북도", country_code: "kr" }, "충북 보은군 보은읍"],
     [{ quarter: "도담동", city: "세종특별자치시", country_code: "kr" }, "세종 도담동"],
-    [{ neighbourhood: "가부키초", city: "신주쿠구", province: "도쿄도", country: "일본", country_code: "jp" }, "신주쿠구 · 일본"],
+    [{ neighbourhood: "가부키초", city: "신주쿠구", province: "도쿄도", country: "일본", country_code: "jp" }, "도쿄 · 일본"],
     [{ city: "Paris", state: "Île-de-France", country: "프랑스", country_code: "fr" }, "Paris · 프랑스"]
   ];
   for (const [address, expected] of cases) assert.equal(regionLabel(address), expected, JSON.stringify(address));
@@ -112,7 +112,14 @@ test("region lookups are rounded, cached, throttled and fail soft", async () => 
   assert.match(calls[0].url, /lat=35\.159&lon=129\.160/, "only a rounded position is sent");
   assert.match(calls[0].url, /accept-language=ko/);
   assert.ok(calls[1].at - calls[0].at >= 140, "requests are spaced out");
-  assert.equal(meta.get(cacheKey(35.15871234, 129.16049876)), "부산 해운대구 우동");
+  assert.deepEqual(meta.get(cacheKey(35.15871234, 129.16049876)),
+    { label: "부산 해운대구 우동", country: "대한민국", countryCode: "kr", province: "부산", city: "부산" });
+  // A label cached by app 1.2 (a plain string) is looked up once more to get country and city.
+  meta.set(cacheKey(37.5, 127.0), "서울 성동구");
+  const before = calls.length;
+  const upgraded = await lookupRegion(37.5, 127.0, store, { fetchImpl, minInterval: 0 });
+  assert.equal(calls.length, before + 1);
+  assert.equal(upgraded.city, "부산");
   const failing = async () => { throw new TypeError("offline"); };
   assert.equal(await regionName(1.234, 2.345, store, { fetchImpl: failing, minInterval: 0 }), "");
   assert.equal(c, "부산 해운대구 우동");
@@ -147,4 +154,125 @@ test("day plans group by capture date, rank places and find existing entries", (
   assert.deepEqual(distinctNames(["서울 성동구 성수동", "", "경기 수원시 팔달구", "서울 성동구 성수동"]),
     ["서울 성동구 성수동", "경기 수원시 팔달구"]);
   assert.equal(googlePhotosDayUrl("2026-10-03"), "https://photos.google.com/search/2026%EB%85%84%2010%EC%9B%94%203%EC%9D%BC");
+});
+
+test("each place knows its country and city (시 level)", () => {
+  const cases = [
+    [{ suburb: "성수동2가", borough: "성동구", city: "서울", country_code: "kr" }, "대한민국", "서울"],
+    [{ suburb: "우동", borough: "해운대구", city: "부산광역시", country_code: "kr" }, "대한민국", "부산"],
+    [{ village: "성산리", town: "성산읍", city: "서귀포시", province: "제주특별자치도", country_code: "kr" }, "대한민국", "서귀포"],
+    [{ suburb: "행궁동", city_district: "팔달구", city: "수원시", province: "경기도", country_code: "kr" }, "대한민국", "수원"],
+    [{ suburb: "해룡면", city: "순천시", province: "전라남도", country: "대한민국", country_code: "kr" }, "대한민국", "순천"],
+    [{ suburb: "태인동", city: "광양시", province: "전라남도", country_code: "kr" }, "대한민국", "광양"],
+    [{ town: "보은읍", county: "보은군", province: "충청북도", country_code: "kr" }, "대한민국", "보은"],
+    [{ quarter: "도담동", city: "세종특별자치시", country_code: "kr" }, "대한민국", "세종"],
+    [{ suburb: "경안동", city: "광주시", province: "경기도", country_code: "kr" }, "대한민국", "광주(경기)"],
+    [{ suburb: "충장동", borough: "동구", city: "광주광역시", country_code: "kr" }, "대한민국", "광주"],
+    [{ neighbourhood: "가부키초", city: "신주쿠구", province: "도쿄도", country: "일본", country_code: "jp" }, "일본", "도쿄"],
+    [{ city: "오사카시", province: "오사카부", country: "일본", country_code: "jp" }, "일본", "오사카"],
+    [{ city: "상하이시", country: "중국", country_code: "cn" }, "중국", "상하이"],
+    [{ city: "Paris", state: "Île-de-France", country: "프랑스", country_code: "fr" }, "프랑스", "Paris"],
+    [{ town: "Hallstatt", state: "Oberösterreich", country: "오스트리아", country_code: "at" }, "오스트리아", "Hallstatt"]
+  ];
+  for (const [address, country, city] of cases) {
+    const info = regionInfo(address);
+    assert.deepEqual([info.country, info.city], [country, city], JSON.stringify(address));
+  }
+  assert.equal(regionInfo({ suburb: "해룡면", city: "순천시", province: "전라남도", country_code: "kr" }).province, "전남");
+  assert.deepEqual(regionInfo(null), { label: "", country: "", countryCode: "", province: "", city: "" });
+  assert.equal(flag("kr"), "🇰🇷");
+  assert.equal(flag("JP"), "🇯🇵");
+  assert.equal(flag(""), "🌐");
+});
+
+test("place search returns pickable places with their country and city", async () => {
+  const urls = [];
+  const fetchImpl = async (url) => {
+    urls.push(url);
+    return new Response(JSON.stringify([
+      { lat: "34.9218", lon: "127.7537", name: "배알도수변공원", display_name: "배알도수변공원, 태인동, 광양시, 전라남도, 대한민국",
+        address: { leisure: "배알도수변공원", suburb: "태인동", city: "광양시", province: "전라남도", country: "대한민국", country_code: "kr" } },
+      { lat: "x", lon: "y", name: "broken" }
+    ]));
+  };
+  const results = await searchPlaces("광양 배알도", { fetchImpl, minInterval: 0 });
+  assert.equal(results.length, 1, "unusable results dropped");
+  assert.deepEqual({ name: results[0].name, lat: results[0].lat, lng: results[0].lng, city: results[0].region.city,
+    country: results[0].region.country, label: results[0].region.label },
+  { name: "배알도수변공원", lat: 34.9218, lng: 127.7537, city: "광양", country: "대한민국", label: "전남 광양시 태인동" });
+  assert.match(urls[0], /\/search\?.*q=%EA%B4%91%EC%96%91/);
+  assert.match(urls[0], /accept-language=ko/);
+  assert.deepEqual(await searchPlaces("   ", { fetchImpl, minInterval: 0 }), []);
+  assert.deepEqual(await searchPlaces("x", { fetchImpl: async () => { throw new TypeError("offline"); }, minInterval: 0 }), []);
+});
+
+// ---------- places by country and city ----------
+import { groupPlaces, placeKey, needsRegion } from "../../snap-diary/js/organize.js";
+import { createEntry as newEntry, createPhoto as newPhoto, serializeEntry, parseEntry, applyRegion, mergeEntries } from "../../snap-diary/js/model.js";
+
+test("entries are grouped by country, then city; trips count under every city", () => {
+  const seoul = { country: "대한민국", countryCode: "kr", province: "서울", city: "서울" };
+  const suncheon = { country: "대한민국", countryCode: "kr", province: "전남", city: "순천" };
+  const kyoto = { country: "일본", countryCode: "jp", province: "교토부", city: "교토시" };
+  const e = (id, date, place, photoRegions = []) => ({
+    id, date, place, photos: photoRegions.map((r, i) => ({ id: `${id}p${i}`, ...r }))
+  });
+  const entries = [
+    e("a", "2026-10-09", { name: "순천만", ...suncheon }),
+    e("b", "2026-10-03", { name: "성수동", ...seoul }, [seoul, suncheon]), // day trip: Seoul -> Suncheon
+    e("c", "2026-09-20", { name: "기요미즈데라", ...kyoto }),
+    e("d", "2026-10-10", { name: "광양 배알도", lat: null, lng: null }), // typed by hand
+    e("e", "2026-10-11", null)
+  ];
+  const { countries, unplaced } = groupPlaces(entries);
+  assert.deepEqual(countries.map((c) => [c.code, c.name, c.count]), [["kr", "대한민국", 2], ["jp", "일본", 1]],
+    "home country first");
+  assert.deepEqual(countries[0].cities.map((c) => [c.city, c.province, c.entries.map((x) => x.id)]),
+    [["순천", "전남", ["a", "b"]], ["서울", "서울", ["b"]]], "cities by number of days, entries newest first");
+  assert.equal(countries[0].cities[0].key, "kr|전남|순천");
+  assert.equal(placeKey(suncheon), "kr|전남|순천");
+  assert.deepEqual(unplaced.map((x) => x.id), ["e", "d"]);
+  assert.equal(needsRegion(e("x", "2026-01-01", { name: "", lat: 37.5, lng: 127 })), true);
+  assert.equal(needsRegion(e("y", "2026-01-01", { name: "", lat: 37.5, lng: 127, ...seoul })), false);
+  assert.equal(needsRegion({ place: null, photos: [{ lat: 1, lng: 2 }] }), true);
+});
+
+test("country and city travel with the entry document to Drive and back", () => {
+  const entry = newEntry({ date: "2026-10-09" });
+  entry.place = applyRegion({ name: "순천만 습지", lat: 34.88, lng: 127.51 },
+    { country: "대한민국", countryCode: "KR", province: "전남", city: "순천", label: "전남 순천시 해룡면" });
+  const photo = newPhoto({ width: 1, height: 1 });
+  applyRegion(photo, { country: "일본", countryCode: "jp", city: "교토시" });
+  entry.photos.push(photo);
+  const back = parseEntry(JSON.stringify(serializeEntry(entry)));
+  assert.deepEqual(back.place, { name: "순천만 습지", lat: 34.88, lng: 127.51, country: "대한민국", countryCode: "kr", province: "전남", city: "순천" });
+  assert.deepEqual([back.photos[0].country, back.photos[0].countryCode, back.photos[0].city], ["일본", "jp", "교토시"]);
+  assert.equal("label" in back.place, false, "only the structured fields are stored");
+  applyRegion(back.place, {});
+  assert.deepEqual(back.place, { name: "순천만 습지", lat: 34.88, lng: 127.51 }, "clearing removes country/city");
+  assert.deepEqual(parseEntry(JSON.stringify(serializeEntry({ ...entry, place: { city: "순천" } }))).place,
+    { name: "", lat: null, lng: null, city: "순천" });
+});
+
+test("a conflict keeps the country/city one phone found for the same position", () => {
+  const suncheon = { country: "대한민국", countryCode: "kr", province: "전남", city: "순천" };
+  const base = newEntry({ date: "2026-10-09" });
+  base.place = { name: "순천만 습지", lat: 34.88, lng: 127.51 };
+  base.photos.push({ ...newPhoto({ width: 1, height: 1 }), lat: 34.88, lng: 127.51 });
+  const filled = structuredClone(base); // phone A filled the city in
+  applyRegion(filled.place, suncheon);
+  applyRegion(filled.photos[0], suncheon);
+  filled.photos[0].placeName = "전남 순천시 해룡면";
+  filled.updatedAt = "2026-10-10T09:00:00.000Z";
+  const edited = structuredClone(base); // phone B edited the text later
+  edited.text = "갈대가 좋았다";
+  edited.updatedAt = "2026-10-10T10:00:00.000Z";
+  for (const merged of [mergeEntries(edited, filled), mergeEntries(filled, edited)]) {
+    assert.equal(merged.text, "갈대가 좋았다");
+    assert.deepEqual([merged.place.country, merged.place.city], ["대한민국", "순천"]);
+    assert.deepEqual([merged.photos[0].city, merged.photos[0].placeName], ["순천", "전남 순천시 해룡면"]);
+  }
+  const moved = structuredClone(edited); // a different position keeps its own (empty) region
+  moved.place = { name: "광양", lat: 34.92, lng: 127.75 };
+  assert.equal(mergeEntries(moved, filled).place.city, undefined);
 });

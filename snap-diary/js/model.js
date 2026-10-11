@@ -130,6 +130,7 @@ function cleanPhoto(p) {
     clean.lng = p.lng;
   }
   if (typeof p.placeName === "string" && p.placeName.trim()) clean.placeName = p.placeName.trim().slice(0, 80);
+  cleanRegion(p, clean);
   if (clean.kind === "video") {
     clean.mime = typeof p.mime === "string" && p.mime.startsWith("video/") ? p.mime : "video/mp4";
     clean.duration = Number.isFinite(p.duration) && p.duration >= 0 ? p.duration : null;
@@ -138,13 +139,36 @@ function cleanPhoto(p) {
   return clean;
 }
 
+const text = (value, max = 60) => (typeof value === "string" ? value.trim().slice(0, max) : "");
+
+/** Country and city (시 level) of a place, kept only when known. */
+function cleanRegion(src, out) {
+  const country = text(src.country), city = text(src.city), province = text(src.province);
+  const code = /^[a-z]{2}$/i.test(src.countryCode || "") ? src.countryCode.toLowerCase() : "";
+  if (country) out.country = country;
+  if (code) out.countryCode = code;
+  if (province) out.province = province;
+  if (city) out.city = city;
+  return out;
+}
+
 function cleanPlace(place) {
   if (!place || typeof place !== "object") return null;
   const name = typeof place.name === "string" ? place.name : "";
   const lat = Number.isFinite(place.lat) ? place.lat : null;
   const lng = Number.isFinite(place.lng) ? place.lng : null;
-  if (!name && lat === null) return null;
-  return { name, lat, lng };
+  if (!name && lat === null && !place.city) return null;
+  return cleanRegion(place, { name, lat, lng });
+}
+
+/** Copies { country, countryCode, province, city } from a geocode.js region onto a place or photo. */
+export function applyRegion(target, region) {
+  if (!target || !region) return target;
+  for (const key of ["country", "countryCode", "province", "city"]) {
+    if (region[key]) target[key] = region[key];
+    else delete target[key];
+  }
+  return target;
 }
 
 /** The JSON document stored in Google Drive. Local sync bookkeeping is excluded. */
@@ -213,6 +237,11 @@ export function mergeEntries(local, remote) {
   if (!merged.title.trim() && loser.title.trim()) merged.title = loser.title;
   if (!merged.mood && loser.mood) merged.mood = loser.mood;
   if (!merged.place && loser.place) merged.place = loser.place;
+  // Country/city found on the other side for the same position is kept.
+  const samePosition = (a, b) => a.lat === b.lat && a.lng === b.lng;
+  if (merged.place && loser.place?.city && !merged.place.city && samePosition(merged.place, loser.place)) {
+    merged.place = applyRegion({ ...merged.place }, loser.place);
+  }
   const byId = new Map(merged.photos.map((p) => [p.id, p]));
   for (const photo of loser.photos) {
     const mine = byId.get(photo.id);
@@ -224,6 +253,10 @@ export function mergeEntries(local, remote) {
       // Keep any Drive ids either side already knows about.
       for (const key of ["driveId", "thumbDriveId", "depthDriveId", "depthSource"]) {
         if (!mine[key] && photo[key]) mine[key] = photo[key];
+      }
+      if (photo.city && !mine.city && samePosition(mine, photo)) {
+        applyRegion(mine, photo);
+        if (!mine.placeName && photo.placeName) mine.placeName = photo.placeName;
       }
     }
   }

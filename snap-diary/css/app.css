@@ -392,3 +392,35 @@ img.ph:not([src]) { visibility: hidden; }
 }
 .update-banner span { flex: 1; }
 .btn-row.center { justify-content: center; }
+
+/* ---------- places by country / city ---------- */
+.place-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: -2px 0 6px; }
+.region-chip { display: inline-flex; align-items: center; gap: 2px; padding: 2px 4px 2px 10px; border-radius: 999px; background: var(--accent-soft); font-size: .82rem; }
+.region-chip[hidden] { display: none; }
+.region-link { margin: -8px 0 14px 6px; background: var(--accent-soft); color: var(--text); }
+.org-region { margin: -2px 0 4px 24px; }
+.country { margin: 6px 0 18px; }
+.country-head { display: flex; align-items: center; gap: 8px; font-size: 1.05rem; margin: 14px 2px 8px; }
+.country-head .flag { font-size: 1.4rem; line-height: 1; }
+.country-head .muted { margin-left: auto; font-weight: 400; }
+.city-list { display: grid; gap: 8px; }
+.city-row {
+  display: flex; align-items: center; gap: 12px; padding: 8px 10px 8px 8px; border-radius: 16px;
+  background: var(--surface); border: 1px solid var(--line); color: var(--text);
+}
+.city-row .icon:last-child { color: var(--muted); flex: none; }
+.city-thumb { width: 54px; height: 54px; flex: none; border-radius: 12px; overflow: hidden; }
+.empty-thumb { display: grid; place-items: center; background: var(--surface-2); color: var(--muted); }
+.city-text { flex: 1; min-width: 0; display: grid; gap: 1px; color: var(--text); }
+.city-text strong, .city-text span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.unplaced .city-row { padding-left: 14px; }
+.section-title { display: flex; align-items: center; gap: 6px; font-size: 1.05rem; margin: 22px 2px 10px; }
+.search-row { display: flex; gap: 8px; margin: 8px 0; }
+.search-input { flex: 1; border: 1px solid var(--line); background: var(--bg); border-radius: 12px; padding: 10px 12px; color: var(--text); }
+.search-results { display: grid; gap: 6px; max-height: 46dvh; overflow-y: auto; margin-bottom: 6px; }
+.search-result {
+  display: grid; gap: 2px; text-align: left; padding: 10px 12px; border-radius: 12px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--bg); color: var(--text);
+}
+.search-result .muted { display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
+.sheet-actions.single { grid-template-columns: 1fr; }
