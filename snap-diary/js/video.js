@@ -51,6 +51,31 @@ async function placeholderPoster() {
   return toJpeg(canvas);
 }
 
+/** iOS Safari ignores preload; seeking (or else a short muted inline play) loads a frame. */
+async function seekTo(video, time) {
+  video.currentTime = time;
+  await waitFor(video, "seeked", 5000).catch(async () => {
+    await video.play();
+    await waitFor(video, "timeupdate", 4000);
+    video.pause();
+  });
+}
+
+/** True for a black/near-black frame (fade-ins, encoder warm-up frames). */
+function isDark(g, canvas) {
+  const step = Math.max(1, Math.floor(Math.min(canvas.width, canvas.height) / 16));
+  const { data } = g.getImageData(0, 0, canvas.width, canvas.height);
+  let sum = 0, n = 0;
+  for (let y = 0; y < canvas.height; y += step) {
+    for (let x = 0; x < canvas.width; x += step) {
+      const i = (y * canvas.width + x) * 4;
+      sum += data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+      n++;
+    }
+  }
+  return sum / n < 10;
+}
+
 async function capturePoster(file) {
   const url = URL.createObjectURL(file);
   const video = document.createElement("video");
@@ -66,16 +91,19 @@ async function capturePoster(file) {
     if (!width || !height) throw new Error("no video track");
     let poster = null;
     try {
-      // iOS Safari ignores preload; seeking (or a muted inline play) loads a frame.
-      video.currentTime = duration ? Math.min(1, duration * 0.1) : 0.001;
-      await waitFor(video, "seeked", 5000).catch(async () => {
-        await video.play();
-        await waitFor(video, "timeupdate", 4000);
-        video.pause();
-      });
       const scale = Math.min(1, POSTER_MAX_SIDE / Math.max(width, height));
       const canvas = canvasOf(Math.round(width * scale), Math.round(height * scale));
-      canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+      const g = canvas.getContext("2d", { willReadFrequently: true });
+      // A frame a little in (1 s, or 10% of short clips), so the poster is not a
+      // fade-in. Recorder files may report no length; 1 s still works there.
+      let time = duration ? Math.min(1, duration * 0.1) : 1;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        await seekTo(video, time);
+        g.drawImage(video, 0, 0, canvas.width, canvas.height);
+        if (!isDark(g, canvas)) break;
+        if (duration && time >= duration - 0.05) break;
+        time = duration ? Math.min(duration - 0.05, time + Math.max(0.5, duration * 0.2)) : time + 1;
+      }
       poster = await toJpeg(canvas);
     } catch (error) {
       console.warn("[Snap Diary] could not grab a video frame", error);

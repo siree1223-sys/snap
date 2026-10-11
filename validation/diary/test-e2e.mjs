@@ -464,18 +464,21 @@ try {
       const canvas = document.createElement("canvas");
       canvas.width = 320; canvas.height = 240;
       const g = canvas.getContext("2d");
+      // The first recorded frame can be blank; the app must skip dark frames.
+      g.fillStyle = "#000"; g.fillRect(0, 0, 320, 240);
       const rec = new MediaRecorder(canvas.captureStream(30), { mimeType: "video/webm" });
       const chunks = [];
       rec.ondataavailable = (e) => chunks.push(e.data);
       const stopped = new Promise((r) => { rec.onstop = r; });
       rec.start(100);
+      await new Promise((r) => setTimeout(r, 300)); // ~0.3 s of black lead-in
       const t0 = performance.now();
       await new Promise((resolve) => {
         const draw = () => {
           const t = performance.now() - t0;
           g.fillStyle = "#1e64c8"; g.fillRect(0, 0, 320, 240);
           g.fillStyle = "#ffd60a"; g.fillRect((t / 8) % 280, 90, 40, 60);
-          if (t < 1500) requestAnimationFrame(draw); else resolve();
+          if (t < 2500) requestAnimationFrame(draw); else resolve();
         };
         draw();
       });
