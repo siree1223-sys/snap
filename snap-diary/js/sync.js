@@ -4,19 +4,32 @@
 //   Snap Diary/
 //     entries/     one JSON document per diary entry
 //     photos/      full-size JPEGs, readable in Drive itself
-//     .app-data/   thumbnails and 3D depth maps
+//     videos/      original video files (resumable upload, any size)
+//     .app-data/   thumbnails, video posters and 3D depth maps
 //
 // Order per run: verify folders -> pull remote changes -> push local changes.
 // Conflicts (both sides edited) are merged without dropping text or photos.
 
-import { parseEntry, serializeEntry, mergeEntries, fileStem } from "./model.js";
+import { parseEntry, serializeEntry, mergeEntries, fileStem, isVideo } from "./model.js";
 import { quote } from "./drive.js";
+import { videoExtension } from "./media.js";
 
+// Per attachment: "photo" is the main file (a JPEG, or the original video),
+// "thumb" the small JPEG (poster for videos), "depth" the 3D depth map.
 const MEDIA = {
   photo: { field: "driveId", folder: "photos", ext: "jpg", mime: "image/jpeg" },
   thumb: { field: "thumbDriveId", folder: "data", ext: "thumb.jpg", mime: "image/jpeg" },
   depth: { field: "depthDriveId", folder: "data", ext: "depth.png", mime: "image/png" }
 };
+// Multipart uploads are limited to 5 MB; larger files use a resumable session.
+const MULTIPART_LIMIT = 4.5 * 1024 * 1024;
+
+function mediaSpec(photo, kind) {
+  if (kind === "photo" && isVideo(photo)) {
+    return { field: "driveId", folder: "videos", ext: videoExtension(photo.mime, photo.name), mime: photo.mime };
+  }
+  return MEDIA[kind];
+}
 
 function cleanSync(file) {
   return { dirty: false, rev: 1, driveId: file.id, remoteModified: file.modifiedTime, trash: [] };
@@ -60,11 +73,19 @@ export function createSync({ drive, db, folderName = "Snap Diary", onProgress = 
   async function folders() {
     const cached = await db.meta.get("folders");
     if (cached?.root) {
+      let alive = false;
       try {
-        const root = await drive.getFile(cached.root);
-        if (!root.trashed) return cached;
+        alive = !(await drive.getFile(cached.root)).trashed;
       } catch (error) {
         if (error.status !== 404) throw error;
+      }
+      if (alive) {
+        // Folders added in later app versions are created on first use.
+        if (!cached.videos) {
+          cached.videos = await drive.ensureFolder("videos", "videos", cached.root);
+          await db.meta.set("folders", cached);
+        }
+        return cached;
       }
       await resetRemote();
     }
@@ -73,6 +94,7 @@ export function createSync({ drive, db, folderName = "Snap Diary", onProgress = 
       root,
       entries: await drive.ensureFolder("entries", "entries", root),
       photos: await drive.ensureFolder("photos", "photos", root),
+      videos: await drive.ensureFolder("videos", "videos", root),
       data: await drive.ensureFolder(".app-data", "data", root)
     };
     await db.meta.set("folders", result);
@@ -154,16 +176,21 @@ export function createSync({ drive, db, folderName = "Snap Diary", onProgress = 
   }
 
   async function uploadMedia(dirs, entry, photo, index, kind) {
-    const spec = MEDIA[kind];
+    const spec = mediaSpec(photo, kind);
     if (photo[spec.field]) return null;
     const blob = await db.blobs.get(`${kind}:${photo.id}`);
     if (!blob) return null;
-    const file = await drive.createFile({
+    const metadata = {
       name: `${fileStem(entry)}_${index + 1}.${spec.ext}`,
       parents: [dirs[spec.folder]],
       mimeType: spec.mime,
-      appProperties: { snapDiary: kind, entryId: entry.id, photoId: photo.id }
-    }, blob);
+      appProperties: { snapDiary: isVideo(photo) && kind === "photo" ? "video" : kind, entryId: entry.id, photoId: photo.id }
+    };
+    const file = blob.size > MULTIPART_LIMIT || (isVideo(photo) && kind === "photo")
+      ? await drive.uploadResumable(metadata, blob, {
+        onProgress: (loaded, total) => onProgress({ phase: "upload", kind: isVideo(photo) ? "video" : kind, loaded, total })
+      })
+      : await drive.createFile(metadata, blob);
     await db.entries.update(entry.id, (cur) => {
       const target = cur?.photos.find((p) => p.id === photo.id);
       if (!target) return undefined;
@@ -253,7 +280,7 @@ export function createSync({ drive, db, folderName = "Snap Diary", onProgress = 
       const key = `${kind}:${photo.id}`;
       const local = await db.blobs.get(key);
       if (local) return local;
-      const fileId = photo[MEDIA[kind].field];
+      const fileId = photo[mediaSpec(photo, kind).field];
       if (!fileId) return null;
       const blob = await drive.download(fileId);
       await db.blobs.put(key, blob);

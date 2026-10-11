@@ -49,7 +49,9 @@ const CLAUSES = [
 
 export function createFakeDrive({ token = "test-token", email = "me@example.com", name = "Me" } = {}) {
   const files = new Map();
+  const sessions = new Map();
   const log = [];
+  let dropNextUpload = null; // accept this many bytes of the next session PUT, then "drop the connection"
   let seq = 0;
   let clock = Date.parse("2026-01-01T00:00:00Z");
   const stamp = () => new Date((clock += 1000)).toISOString();
@@ -105,12 +107,64 @@ export function createFakeDrive({ token = "test-token", email = "me@example.com"
     file.modifiedTime = stamp();
   }
 
+  function concat(chunks) {
+    const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+    let at = 0;
+    for (const c of chunks) { out.set(c, at); at += c.length; }
+    return out;
+  }
+
+  // Resumable upload protocol: POST opens a session, PUTs send byte ranges,
+  // "bytes */total" asks how much arrived (308 + Range until complete).
+  function resumable(method, url, headers, body) {
+    const uploadId = url.searchParams.get("upload_id");
+    if (method === "POST" && !uploadId) {
+      if (headers.authorization !== `Bearer ${token}`) return json(401, { error: { code: 401, message: "Invalid Credentials" } });
+      const id = `u${++seq}`;
+      sessions.set(id, {
+        metadata: JSON.parse(dec.decode(body)), mime: headers["x-upload-content-type"],
+        total: Number(headers["x-upload-content-length"]), chunks: [], received: 0, file: null, puts: 0
+      });
+      return { status: 200, headers: {
+        location: `https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=${id}`,
+        "x-guploader-uploadid": id
+      }, body: "" };
+    }
+    const session = sessions.get(uploadId);
+    if (method !== "PUT" || !session) return json(404, { error: { code: 404, message: "Upload session not found" } });
+    const range = headers["content-range"] || "";
+    const progress = () => ({ status: 308, headers: session.received ? { range: `bytes=0-${session.received - 1}` } : {}, body: "" });
+    if (/^bytes \*\/\d+$/.test(range)) return session.file ? json(200, view(session.file)) : progress();
+    const m = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(range);
+    // Strict: the client must continue exactly where the session stopped.
+    if (!m || Number(m[3]) !== session.total || Number(m[1]) !== session.received) {
+      return json(400, { error: { code: 400, message: `bad Content-Range ${range}` } });
+    }
+    session.puts++;
+    let data = body || new Uint8Array(0);
+    let dropped = false;
+    if (dropNextUpload !== null) {
+      data = data.slice(0, dropNextUpload);
+      dropNextUpload = null;
+      dropped = true;
+    }
+    session.chunks.push(data);
+    session.received += data.length;
+    if (dropped) return { networkError: true };
+    if (session.received < session.total) return progress();
+    session.file = create(session.metadata, concat(session.chunks), session.mime);
+    return json(200, view(session.file));
+  }
+
   /** request: { method, url, headers, body: Uint8Array|null } */
   async function handle(request) {
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
     const headers = Object.fromEntries(Object.entries(request.headers || {}).map(([k, v]) => [k.toLowerCase(), v]));
     log.push(`${method} ${url.pathname}${url.search}`);
+    if (url.pathname === "/upload/drive/v3/files" && url.searchParams.get("uploadType") === "resumable") {
+      return resumable(method, url, headers, request.body);
+    }
     if (headers.authorization !== `Bearer ${token}`) return json(401, { error: { code: 401, message: "Invalid Credentials" } });
     const path = url.pathname;
     if (path === "/drive/v3/about") return json(200, { user: { emailAddress: email, displayName: name } });
@@ -152,12 +206,15 @@ export function createFakeDrive({ token = "test-token", email = "me@example.com"
     if (init.body instanceof Blob) body = new Uint8Array(await init.body.arrayBuffer());
     else if (typeof init.body === "string") body = enc.encode(init.body);
     const result = await handle({ method: init.method || "GET", url: String(input), headers: init.headers || {}, body });
-    return new Response(result.body ?? null, { status: result.status, headers: result.headers });
+    if (result.networkError) throw new TypeError("fetch failed");
+    return new Response(result.status === 308 || !result.body ? null : result.body, { status: result.status, headers: result.headers });
   }
 
   return {
     files,
+    sessions,
     log,
+    dropNextUpload: (bytes) => { dropNextUpload = bytes; },
     handle,
     fetch: fetchImpl,
     token,

@@ -64,10 +64,13 @@ export function createEntry({ date = toISODate(), now = new Date() } = {}) {
   };
 }
 
-export function createPhoto({ width, height, kind = "photo", name = "" }) {
-  return {
+const KINDS = new Set(["photo", "place", "video"]);
+
+/** One attachment: a photo, a 3D place photo, or a video (+ its poster). */
+export function createPhoto({ width, height, kind = "photo", name = "", mime = "", duration = null, size = 0 }) {
+  const photo = {
     id: newId(),
-    kind: kind === "place" ? "place" : "photo",
+    kind: KINDS.has(kind) ? kind : "photo",
     caption: "",
     name,
     width,
@@ -77,7 +80,11 @@ export function createPhoto({ width, height, kind = "photo", name = "" }) {
     depthDriveId: null,
     depthSource: null
   };
+  if (photo.kind === "video") Object.assign(photo, { mime, duration, size });
+  return photo;
 }
+
+export const isVideo = (photo) => photo?.kind === "video";
 
 export function isEntryEmpty(entry) {
   return !entry.title.trim() && !entry.text.trim() && entry.photos.length === 0 &&
@@ -94,9 +101,9 @@ export function touch(entry, now = new Date()) {
 }
 
 function cleanPhoto(p) {
-  return {
+  const clean = {
     id: String(p.id),
-    kind: p.kind === "place" ? "place" : "photo",
+    kind: KINDS.has(p.kind) ? p.kind : "photo",
     caption: typeof p.caption === "string" ? p.caption : "",
     name: typeof p.name === "string" ? p.name : "",
     width: Number(p.width) || 0,
@@ -106,6 +113,12 @@ function cleanPhoto(p) {
     depthDriveId: p.depthDriveId || null,
     depthSource: p.depthSource === "ai" || p.depthSource === "heuristic" ? p.depthSource : null
   };
+  if (clean.kind === "video") {
+    clean.mime = typeof p.mime === "string" && p.mime.startsWith("video/") ? p.mime : "video/mp4";
+    clean.duration = Number.isFinite(p.duration) && p.duration >= 0 ? p.duration : null;
+    clean.size = Number.isFinite(p.size) && p.size >= 0 ? p.size : 0;
+  }
+  return clean;
 }
 
 function cleanPlace(place) {

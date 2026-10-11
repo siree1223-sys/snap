@@ -10,7 +10,7 @@ import { commitEdit, deleteEntry, attachDepth } from "../../snap-diary/js/repo.j
 
 function device(fake, { onUnauthorized } = {}) {
   const db = createMemoryDB();
-  const drive = createDriveClient(async () => fake.token, { fetchImpl: fake.fetch, retryDelay: 1, onUnauthorized });
+  const drive = createDriveClient(async () => fake.token, { fetchImpl: fake.fetch, retryDelay: 1, onUnauthorized, useXhr: false });
   const sync = createSync({ drive, db, folderName: "Snap Diary" });
   return { db, drive, sync };
 }
@@ -259,4 +259,105 @@ test("concurrent run() calls share one sync", async () => {
   assert.equal(one, two);
   assert.equal(fake.live("entry").length, 1);
   assert.equal(fake.live("root").length, 1);
+});
+
+// ---------- videos ----------
+
+function randomBytes(n, seed = 7) {
+  const out = new Uint8Array(n);
+  let x = seed;
+  for (let i = 0; i < n; i++) { x = (x * 1103515245 + 12345) >>> 0; out[i] = x >>> 24; }
+  return out;
+}
+
+async function writeVideoEntry(dev, bytes) {
+  const entry = createEntry({ date: "2026-10-12" });
+  entry.title = "한강 자전거";
+  const video = createPhoto({ width: 1920, height: 1080, kind: "video", name: "IMG_0001.MOV", mime: "video/quicktime", duration: 12.5, size: bytes.length });
+  entry.photos.push(video);
+  await dev.db.blobs.put(`photo:${video.id}`, new Blob([bytes], { type: "video/quicktime" }));
+  await dev.db.blobs.put(`thumb:${video.id}`, jpeg("poster"));
+  await commitEdit(dev.db, entry);
+  return { entry, video };
+}
+
+test("videos go to videos/ through a resumable session, posters to .app-data", async () => {
+  const fake = createFakeDrive();
+  const a = device(fake);
+  const bytes = randomBytes(300_000);
+  const { video } = await writeVideoEntry(a, bytes);
+  const progress = [];
+  const sync = createSync({ drive: a.drive, db: a.db, onProgress: (e) => { if (e.phase === "upload") progress.push(e.loaded); } });
+  await sync.run();
+  const [file] = fake.live("video");
+  const [videos] = fake.live("videos");
+  assert.equal(file.parents[0], videos.id);
+  assert.equal(file.name, "2026-10-12_한강 자전거_1.mov");
+  assert.equal(file.mimeType, "video/quicktime");
+  assert.deepEqual(file.content, bytes, "byte-for-byte");
+  assert.equal(fake.sessions.size, 1, "one resumable session");
+  assert.equal(fake.live("thumb").length, 1);
+  assert.equal(fake.live("photo").length, 0, "videos are not mixed into photos/");
+  assert.equal(progress.at(-1), bytes.length, "progress reaches 100%");
+  const doc = JSON.parse(fake.text(fake.live("entry")[0].id));
+  assert.deepEqual({ kind: doc.photos[0].kind, mime: doc.photos[0].mime, duration: doc.photos[0].duration, size: doc.photos[0].size },
+    { kind: "video", mime: "video/quicktime", duration: 12.5, size: bytes.length });
+  const b = device(fake);
+  await b.sync.run();
+  const copy = (await b.db.entries.get(doc.id)).photos[0];
+  assert.equal(copy.kind, "video");
+  const downloaded = new Uint8Array(await (await b.sync.media(copy, "photo")).arrayBuffer());
+  assert.deepEqual(downloaded, bytes, "second device plays the same file");
+  assert.equal(await (await b.sync.media(copy, "thumb")).text(), "JPEG:poster");
+  assert.equal(video.id, copy.id);
+});
+
+test("an interrupted video upload resumes from the byte the session confirmed", async () => {
+  const fake = createFakeDrive();
+  const a = device(fake);
+  const bytes = randomBytes(250_000, 11);
+  await writeVideoEntry(a, bytes);
+  fake.dropNextUpload(100_000); // the connection dies after 100 kB
+  await a.sync.run();
+  const [file] = fake.live("video");
+  assert.deepEqual(file.content, bytes, "no gap, no duplicate bytes");
+  const [session] = fake.sessions.values();
+  assert.equal(fake.sessions.size, 1, "same session continued");
+  assert.equal(session.puts, 2, "second PUT carried only the remainder");
+  assert.ok(fake.log.some((line) => line.startsWith("PUT") && line.includes("upload_id")));
+});
+
+test("an expired upload session starts over in a new one", async () => {
+  const fake = createFakeDrive();
+  const db = createMemoryDB();
+  let killed = false;
+  const fetchImpl = async (url, init) => {
+    if (!killed && init.method === "PUT" && String(url).includes("upload_id")) {
+      killed = true;
+      fake.sessions.clear(); // Google forgot the session (e.g. a week later)
+    }
+    return fake.fetch(url, init);
+  };
+  const drive = createDriveClient(async () => fake.token, { fetchImpl, retryDelay: 1, useXhr: false });
+  const sync = createSync({ drive, db });
+  const bytes = randomBytes(50_000, 3);
+  await writeVideoEntry({ db }, bytes);
+  await sync.run();
+  assert.deepEqual(fake.live("video")[0].content, bytes);
+});
+
+test("diaries created before videos existed get a videos/ folder on first sync", async () => {
+  const fake = createFakeDrive();
+  const a = device(fake);
+  await writeEntry(a);
+  await a.sync.run();
+  const old = await a.db.meta.get("folders");
+  delete old.videos; // what an app 1.0.0 install has cached
+  await a.db.meta.set("folders", old);
+  for (const f of fake.byRole("videos")) fake.files.delete(f.id);
+  await writeVideoEntry(a, randomBytes(1000));
+  await a.sync.run();
+  assert.equal(fake.live("videos").length, 1);
+  assert.equal(fake.live("video")[0].parents[0], fake.live("videos")[0].id);
+  assert.equal(fake.live("root").length, 1, "same diary root");
 });

@@ -39,9 +39,9 @@ jobs:
         run: npm run test:diary
       - name: Build site
         run: npm run build:diary
-      - name: Install Playwright Chromium
+      - name: Install Playwright Chromium (+ the HEIC decoder the app loads from its CDN)
         run: |
-          npm install --no-save --no-package-lock playwright@1.56.1
+          npm install --no-save --no-package-lock playwright@1.56.1 heic-to@1.5.2
           npx playwright install --with-deps chromium
       - name: End-to-end browser test
         run: node validation/diary/test-e2e.mjs
